@@ -379,3 +379,129 @@ impl Sender {
 fn bump_by_percent(n: u128, percent: u8) -> u128 {
     n + n * percent as u128 / 100
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{bump_by_percent, Sender};
+    use crate::{chain, Message};
+    use alloy::primitives::Address;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    // A minimal mock that satisfies NonceManager::new inside Sender::new.
+    fn base_mock() -> chain::MockChainClient {
+        let mut mock = chain::MockChainClient::new();
+        mock.expect_get_account_nonce()
+            .returning(|_| Box::pin(async { Ok(0u64) }));
+        mock
+    }
+
+    async fn make_sender(mock: chain::MockChainClient) -> Sender {
+        Sender::new(Arc::new(mock), Address::default()).await.unwrap()
+    }
+
+    // ── bump_by_percent ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_bump_zero_base() {
+        assert_eq!(bump_by_percent(0, 20), 0);
+    }
+
+    #[test]
+    fn test_bump_twenty_percent() {
+        assert_eq!(bump_by_percent(100, 20), 120);
+    }
+
+    #[test]
+    fn test_bump_zero_percent() {
+        assert_eq!(bump_by_percent(500, 0), 500);
+    }
+
+    #[test]
+    fn test_bump_is_an_increase_not_a_fraction() {
+        // Regression: the original formula was `n * percent / 100` (20% OF n),
+        // which produced a replacement fee LOWER than the original.
+        // Correct formula: `n + n * percent / 100` (n bumped BY percent%).
+        let fee: u128 = 1_000_000_000;
+        let bumped = bump_by_percent(fee, 20);
+        assert!(bumped > fee, "bumped fee must exceed the original");
+        assert_eq!(bumped, 1_200_000_000);
+    }
+
+    // ── Sender::new / add_message ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_new_has_empty_queue() {
+        let sender = make_sender(base_mock()).await;
+        assert_eq!(sender.queue.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_message_enqueues() {
+        let sender = make_sender(base_mock()).await;
+        sender.add_message(Message::default()).await;
+        assert_eq!(sender.queue.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_multiple_messages() {
+        let sender = make_sender(base_mock()).await;
+        for _ in 0..4 {
+            sender.add_message(Message::default()).await;
+        }
+        assert_eq!(sender.queue.lock().await.len(), 4);
+    }
+
+    // ── run() ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_errors_when_block_stream_closes() {
+        let mut mock = base_mock();
+        mock.expect_subscribe_new_blocks().returning(|| {
+            // The sender half is dropped immediately, so the receiver is closed.
+            let (_tx, rx) = mpsc::channel(1);
+            Box::pin(async move { Ok(rx) })
+        });
+
+        let sender = make_sender(mock).await;
+        let result = sender.run().await;
+        assert!(result.is_err(), "run() must return Err when the block stream closes");
+    }
+
+    // ── process_next_message() ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_process_next_message_returns_quickly_with_empty_queue() {
+        let sender = make_sender(base_mock()).await;
+        // With no messages, process_next_message should yield once and return.
+        tokio::time::timeout(Duration::from_millis(500), sender.process_next_message())
+            .await
+            .expect("process_next_message blocked with an empty queue");
+    }
+
+    #[tokio::test]
+    async fn test_process_next_message_pops_and_attempts_send() {
+        let mut mock = base_mock();
+        // chain.id() is called to build the TxEip1559.
+        mock.expect_id().returning(|| 1337u64);
+        // Inject a chain-level failure so we don't need a real provider.
+        mock.expect_send_transaction().returning(|_| {
+            Box::pin(async { Err(chain::Error::Subscription("injected".into())) })
+        });
+
+        let sender = make_sender(mock).await;
+        let mut msg = Message::default();
+        msg.to = Some(Address::default());
+        msg.gas = 21_000;
+        sender.add_message(msg).await;
+        assert_eq!(sender.queue.lock().await.len(), 1);
+
+        sender.process_next_message().await;
+        // Give the spawned task time to run to completion.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Message was popped regardless of the send outcome.
+        assert_eq!(sender.queue.lock().await.len(), 0);
+    }
+}

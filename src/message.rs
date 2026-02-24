@@ -241,4 +241,62 @@ mod tests {
 
         assert!(!message.can_retry());
     }
+
+    // ── is_expired ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_expired_with_past_deadline() {
+        let mut msg = Message::default();
+        let past: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+        msg.deadline = Some(past);
+        assert!(msg.is_expired());
+    }
+
+    #[test]
+    fn test_is_not_expired_with_no_deadline() {
+        assert!(!Message::default().is_expired());
+    }
+
+    #[test]
+    fn test_is_not_expired_with_future_deadline() {
+        let mut msg = Message::default();
+        let future: DateTime<Utc> = "2099-01-01T00:00:00Z".parse().unwrap();
+        msg.deadline = Some(future);
+        assert!(!msg.is_expired());
+    }
+
+    // ── effective_priority edge cases ────────────────────────────────────────
+
+    #[test]
+    fn test_effective_priority_zero_when_deadline_passed() {
+        let mut msg = Message::default();
+        msg.priority = 50;
+        let past: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+        msg.deadline = Some(past);
+        assert_eq!(msg.effective_priority(), 0);
+    }
+
+    // ── Message::new guarantees ──────────────────────────────────────────────
+
+    #[test]
+    fn test_new_clamps_priority_to_max() {
+        // Priorities above MAX_PRIORITY must be silently clamped at construction.
+        let msg = Message::new(None, 21_000, U256::ZERO, Bytes::default(), 200, None);
+        assert_eq!(msg.priority, MAX_PRIORITY);
+    }
+
+    #[test]
+    fn test_new_accepts_priority_at_max() {
+        let msg = Message::new(None, 21_000, U256::ZERO, Bytes::default(), MAX_PRIORITY, None);
+        assert_eq!(msg.priority, MAX_PRIORITY);
+    }
+
+    // ── Display ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_display_format() {
+        let s = format!("{}", Message::default());
+        assert!(s.starts_with("Message {"), "unexpected Display output: {s}");
+        assert!(s.contains("retry_count: 0"));
+    }
 }

@@ -101,3 +101,107 @@ impl NonceManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::MockChainClient;
+    use alloy::primitives::Address;
+
+    // Build a mock that always returns the given nonce for get_account_nonce.
+    fn mock_at_nonce(initial: u64) -> MockChainClient {
+        let mut mock = MockChainClient::new();
+        mock.expect_get_account_nonce()
+            .returning(move |_| Box::pin(async move { Ok(initial) }));
+        mock
+    }
+
+    async fn nonce_manager_at(nonce: u64) -> NonceManager {
+        NonceManager::new(Arc::new(mock_at_nonce(nonce)), Address::default())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_new_fetches_initial_nonce() {
+        let nm = nonce_manager_at(7).await;
+        assert_eq!(*nm.current_nonce.lock().await, 7);
+    }
+
+    #[tokio::test]
+    async fn test_sequential_assignment() {
+        let nm = nonce_manager_at(0).await;
+        assert_eq!(nm.get_next_available_nonce().await, 0);
+        assert_eq!(nm.get_next_available_nonce().await, 1);
+        assert_eq!(nm.get_next_available_nonce().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_starts_from_offset() {
+        // Initial on-chain nonce of 5; first local assignment must be 5.
+        let nm = nonce_manager_at(5).await;
+        assert_eq!(nm.get_next_available_nonce().await, 5);
+        assert_eq!(nm.get_next_available_nonce().await, 6);
+    }
+
+    #[tokio::test]
+    async fn test_mark_available_allows_reuse() {
+        let nm = nonce_manager_at(0).await;
+        let n = nm.get_next_available_nonce().await; // assigns 0
+        nm.mark_nonce_available(n).await;            // returns 0 to the pool
+        // next assignment should give 0 again
+        assert_eq!(nm.get_next_available_nonce().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_advances_baseline_and_prunes_in_flight() {
+        let nm = nonce_manager_at(0).await;
+        nm.get_next_available_nonce().await; // 0 in-flight
+        nm.get_next_available_nonce().await; // 1 in-flight
+        // Confirming nonce 2 should prune both 0 and 1.
+        nm.update_current_nonce(2).await;
+        assert_eq!(*nm.current_nonce.lock().await, 2);
+        assert!(nm.in_flight_nonces.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_ignores_rollback() {
+        let nm = nonce_manager_at(10).await;
+        // A lower value must not roll back the baseline.
+        nm.update_current_nonce(5).await;
+        assert_eq!(*nm.current_nonce.lock().await, 10);
+    }
+
+    #[tokio::test]
+    async fn test_update_retains_higher_in_flight_nonces() {
+        let nm = nonce_manager_at(0).await;
+        nm.get_next_available_nonce().await; // 0
+        nm.get_next_available_nonce().await; // 1
+        nm.get_next_available_nonce().await; // 2
+        // Confirming up to 1 should prune 0 but keep 1 and 2.
+        nm.update_current_nonce(1).await;
+        let in_flight = nm.in_flight_nonces.lock().await.clone();
+        assert!(!in_flight.contains(&0), "nonce 0 is below the new baseline");
+        assert!(in_flight.contains(&1), "nonce 1 is at the new baseline");
+        assert!(in_flight.contains(&2), "nonce 2 is above the new baseline");
+    }
+
+    #[tokio::test]
+    async fn test_sync_nonce_updates_from_chain() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // First call (from new()) returns 0; subsequent calls (from sync_nonce) return 5.
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter2 = counter.clone();
+        let mut mock = MockChainClient::new();
+        mock.expect_get_account_nonce().returning(move |_| {
+            let n = counter2.fetch_add(1, Ordering::SeqCst);
+            let nonce = if n == 0 { 0u64 } else { 5u64 };
+            Box::pin(async move { Ok(nonce) })
+        });
+
+        let nm = NonceManager::new(Arc::new(mock), Address::default()).await.unwrap();
+        assert_eq!(*nm.current_nonce.lock().await, 0);
+        nm.sync_nonce().await.unwrap();
+        assert_eq!(*nm.current_nonce.lock().await, 5);
+    }
+}
