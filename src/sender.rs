@@ -393,7 +393,7 @@ mod tests {
     fn base_mock() -> chain::MockChainClient {
         let mut mock = chain::MockChainClient::new();
         mock.expect_get_account_nonce()
-            .returning(|_| Box::pin(async { Ok(0u64) }));
+            .returning(|_| Ok(0u64));
         mock
     }
 
@@ -461,7 +461,7 @@ mod tests {
         mock.expect_subscribe_new_blocks().returning(|| {
             // The sender half is dropped immediately, so the receiver is closed.
             let (_tx, rx) = mpsc::channel(1);
-            Box::pin(async move { Ok(rx) })
+            Ok(rx)
         });
 
         let sender = make_sender(mock).await;
@@ -487,7 +487,7 @@ mod tests {
         mock.expect_id().returning(|| 1337u64);
         // Inject a chain-level failure so we don't need a real provider.
         mock.expect_send_transaction().returning(|_| {
-            Box::pin(async { Err(chain::Error::Subscription("injected".into())) })
+            Err(chain::Error::Subscription("injected".into()))
         });
 
         let sender = make_sender(mock).await;

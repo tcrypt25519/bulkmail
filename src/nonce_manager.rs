@@ -112,7 +112,7 @@ mod tests {
     fn mock_at_nonce(initial: u64) -> MockChainClient {
         let mut mock = MockChainClient::new();
         mock.expect_get_account_nonce()
-            .returning(move |_| Box::pin(async move { Ok(initial) }));
+            .returning(move |_| Ok(initial));
         mock
     }
 
@@ -196,7 +196,7 @@ mod tests {
         mock.expect_get_account_nonce().returning(move |_| {
             let n = counter2.fetch_add(1, Ordering::SeqCst);
             let nonce = if n == 0 { 0u64 } else { 5u64 };
-            Box::pin(async move { Ok(nonce) })
+            Ok(nonce)
         });
 
         let nm = NonceManager::new(Arc::new(mock), Address::default()).await.unwrap();
