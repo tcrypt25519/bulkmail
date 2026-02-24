@@ -1,6 +1,19 @@
+//! Max-heap priority queue for [`Message`] values. See [`PriorityQueue`].
+//!
+//! [`Message`]: crate::Message
+
 use crate::message::Message;
 use std::{cmp::Ordering, collections::BinaryHeap};
 
+/// A max-heap queue that orders [`Message`] values by their [`effective_priority`].
+///
+/// [`effective_priority`] is evaluated at push time and stored alongside the
+/// message. This means priority does not change while a message sits in the
+/// queue - callers that need dynamic re-prioritization should pop and re-push
+/// the message.
+///
+/// [`Message`]: crate::Message
+/// [`effective_priority`]: crate::Message::effective_priority
 #[derive(Debug)]
 pub(crate) struct PriorityQueue {
     heap: BinaryHeap<PrioritizedMessage>,
@@ -35,12 +48,15 @@ impl PartialOrd for PrioritizedMessage {
 }
 
 impl PriorityQueue {
+    /// Creates a new empty [`PriorityQueue`].
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
         }
     }
 
+    /// Pushes `message` onto the queue, capturing its effective priority at
+    /// insertion time.
     pub fn push(&mut self, message: Message) {
         let effective_priority = message.effective_priority();
         self.heap.push(PrioritizedMessage {
@@ -49,15 +65,18 @@ impl PriorityQueue {
         });
     }
 
+    /// Removes and returns the highest-priority message, or `None` if empty.
     pub fn pop(&mut self) -> Option<Message> {
         self.heap.pop().map(|pm| pm.message)
     }
 
+    /// Returns `true` if the queue contains no messages.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
+    /// Returns the number of messages currently in the queue.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.heap.len()
@@ -80,22 +99,16 @@ mod tests {
     fn test_priority_queue() -> Result<(), Error> {
         let mut queue = PriorityQueue::new();
 
-        let msg1 = Message {
-            to: Some(Address::default()),
-            ..Default::default()
-        };
+        let mut msg1 = Message::default();
+        msg1.to = Some(Address::default());
 
-        let msg2 = Message {
-            to: Some(Address::default()),
-            priority: 1,
-            ..Default::default()
-        };
+        let mut msg2 = Message::default();
+        msg2.to = Some(Address::default());
+        msg2.priority = 1;
 
-        let msg3 = Message {
-            to: Some(Address::default()),
-            priority: 2,
-            ..Default::default()
-        };
+        let mut msg3 = Message::default();
+        msg3.to = Some(Address::default());
+        msg3.priority = 2;
 
         queue.push(msg1);
         queue.push(msg2);
@@ -115,14 +128,11 @@ mod tests {
 
     #[test]
     fn test_prioritized_message_ordering() -> Result<(), Error> {
-        let msg1 = Message{
-            priority: 1,
-            ..Default::default()
-        };
-        let msg2 = Message{
-            priority: 2,
-            ..Default::default()
-        };
+        let mut msg1 = Message::default();
+        msg1.priority = 1;
+
+        let mut msg2 = Message::default();
+        msg2.priority = 2;
 
         let pm1 = PrioritizedMessage {
             message: msg1,
