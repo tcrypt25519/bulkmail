@@ -61,12 +61,11 @@ async fn main() -> Result<(), Error> {
 async fn continuous_send(addr: Address, sender: Arc<Sender>, chain: Chain) -> Result<(), Error> {
     loop {
         // Send a new message
-        sender.add_message(Message {
-            to: Some(Address::default()),
-            gas: 21_000u64,
-            value: U256::from(1_000_000u64), // 1 gwei
-            ..Default::default()
-        }).await;
+        let mut msg = Message::default();
+        msg.to = Some(Address::default());
+        msg.gas = 21_000u64;
+        msg.value = U256::from(1_000_000u64); // 1 gwei
+        sender.add_message(msg).await;
 
         // Generate a random delay between 500ms and 1s
         let delay = rand::random_range(20..200);
