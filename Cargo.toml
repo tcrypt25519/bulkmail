@@ -7,29 +7,36 @@ description = "Transaction sending system"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-tokio = { version = "1.28", features = ["full"] }
-async-trait = "0.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-log = "0.4"
-env_logger = "0.10"
+tokio = { version = "1.49.0", features = ["full"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+log = "0.4.29"
+env_logger = "0.10.2"
 dotenv = "0.15"
-chrono = "0.4"
-futures = "0.3"
-rand = "0.8"
+chrono = "0.4.43"
+futures = "0.3.32"
+rand = "0.10.0"
 hex = "0.4"
-thiserror = "1.0.63"
-secp256k1 = "0.20"
-ethereum-types = "0.12"
-alloy = { version = "0.2", features = ["full"] }
-alloy-node-bindings = "0.2.1"
-simple_logger = "5.0.0"
+thiserror = "2.0.18"
+secp256k1 = "0.31.1"
+ethereum-types = "0.16.0"
+alloy = { version = "1.7.3", default-features = false, features = [
+    "std",
+    "provider-ws",
+    "pubsub",
+    "rpc-types",
+    "signer-local",
+    "k256",
+] }
+alloy-node-bindings = "1.7.3"
+simple_logger = "5.2.0"
 
 
 [dev-dependencies]
-tokio-test = "0.4"
-tokio = { version = "1.39", features = ["full", "test-util"] }
-mockall = "0.13"
+tokio-test = "0.4.5"
+tokio = { version = "1.49.0", features = ["full", "test-util"] }
+mockall = "0.14.0"
 jsonrpc-core = "18"
 
 [[bin]]

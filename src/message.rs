@@ -1,3 +1,7 @@
+//! Transaction intent. See [`Message`].
+//!
+//! [`Message`]: Message
+
 use alloy::primitives::{Address, Bytes, U256};
 use chrono::{DateTime, Utc};
 use std::fmt::Display;
@@ -8,25 +12,58 @@ const BLOCK_TIME: u32 = 2;
 const POINTS_PER_BLOCK: u32 = 1;
 const MAX_RETRIES: u32 = 3;
 
+/// A transaction intent - the data needed to build and send an EIP-1559 transaction.
+///
+/// [`Message`] separates intent from execution. Nonces and gas prices are not
+/// stored here; they are bound late by the nonce and gas-price managers
+/// immediately before submission. This allows messages to be re-queued and
+/// retried without invalidating earlier state.
+///
+/// ## Priority
+///
+/// [`effective_priority`] combines `priority`, `retry_count`, elapsed age in
+/// blocks, and a deadline boost. Messages approaching their deadline within 2
+/// blocks receive a full priority boost (100 points); within 10 blocks,
+/// one-third of that. A message whose deadline has already passed returns an
+/// effective priority of 0, causing it to be filtered out before sending.
+///
+/// [`effective_priority`]: Self::effective_priority
 #[derive(Debug, Clone)]
 pub struct Message {
+    /// The recipient address, or `None` for a contract-creation transaction.
     pub to: Option<Address>,
-    pub value: U256,
-    pub data: Bytes,
-    pub gas: u128,
 
+    /// The ETH value to transfer, in wei.
+    pub value: U256,
+
+    /// The call data payload.
+    pub data: Bytes,
+
+    /// The gas limit for this transaction.
+    pub gas: u64,
+
+    /// The caller-assigned base priority (0 to 100).
     pub priority: u32,
+
+    /// An optional block deadline after which this message should be discarded.
     pub deadline: Option<DateTime<Utc>>,
 
-    pub created_at: Instant,
-    pub retry_count: u32,
+    /// The wall-clock time at which this message was created, used to compute
+    /// the age factor in [`effective_priority`].
+    ///
+    /// [`effective_priority`]: Self::effective_priority
+    created_at: Instant,
+
+    /// The number of times this message has been retried after a dropped transaction.
+    retry_count: u32,
 }
 
 impl Message {
+    /// Creates a new [`Message`] with the given parameters and zero retries.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         to: Option<Address>,
-        gas: u128,
+        gas: u64,
         value: U256,
         data: Bytes,
         priority: u32,
@@ -37,12 +74,24 @@ impl Message {
             gas,
             value,
             data,
-            priority,
+            priority: priority.min(MAX_PRIORITY),
             deadline,
             ..Default::default()
         }
     }
 
+    /// Returns the computed priority used to order this message in the queue.
+    ///
+    /// The formula is:
+    ///
+    /// ```text
+    /// effective_priority = priority + retry_count + age_factor + deadline_factor
+    /// ```
+    ///
+    /// Returns `0` if the message deadline has already passed, which causes
+    /// [`is_expired`] to filter it before sending.
+    ///
+    /// [`is_expired`]: Self::is_expired
     pub fn effective_priority(&self) -> u32 {
         // Get the deadline factor.
         // If it's None then we don't influence the priority.
@@ -61,8 +110,9 @@ impl Message {
     }
 
     /// Returns a factor to boost the priority based on the deadline.
-    /// Returns None if there is no deadline.
-    /// Returns Some(0) if the deadline has passed.
+    ///
+    /// Returns `None` if there is no deadline or the deadline is more than 10
+    /// blocks away. Returns `Some(0)` if the deadline has passed.
     fn deadline_factor(&self) -> Option<u32> {
         match self.deadline {
             None => None,
@@ -88,15 +138,18 @@ impl Message {
         }
     }
 
+    /// Increments the retry counter and returns `true` if further retries are allowed.
     pub fn increment_retry(&mut self) -> bool {
         self.retry_count = self.retry_count.saturating_add(1);
         self.can_retry()
     }
 
+    /// Returns `true` if this message has not yet exhausted its retry budget.
     pub fn can_retry(&self) -> bool {
         self.retry_count < MAX_RETRIES
     }
 
+    /// Returns `true` if the message deadline has passed and the message should be discarded.
     pub fn is_expired(&self) -> bool {
         if let Some(deadline) = self.deadline {
             Utc::now() > deadline
@@ -135,7 +188,7 @@ mod tests {
     #[test]
     fn test_new_message() {
         let to = Some(Address::default());
-        let gas = 21_000u128;
+        let gas = 21_000u64;
         let value = U256::from(0);
         let data = Bytes::default();
         let priority = 1;
@@ -150,7 +203,7 @@ mod tests {
     #[test]
     fn test_effective_priority() {
         let to = Some(Address::default());
-        let gas = 21_000u128;
+        let gas = 21_000u64;
         let value = U256::from(0);
         let data = Bytes::default();
         let priority = 1;
@@ -172,7 +225,7 @@ mod tests {
     #[test]
     fn test_can_retry() {
         let to = Some(Address::default());
-        let gas = 21_000u128;
+        let gas = 21_000u64;
         let value = U256::from(0);
         let data = Bytes::default();
         let priority = 1;

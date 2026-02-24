@@ -2,8 +2,6 @@ use alloy::primitives::{Address, U256};
 use alloy_node_bindings::Anvil;
 use bulkmail::{Chain, Message, Sender};
 use log::{error, info, LevelFilter};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use simple_logger::SimpleLogger;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +42,7 @@ async fn main() -> Result<(), Error> {
 
     // Start services
     let chain = Chain::new(&anvil.ws_endpoint(), sender_key.clone().into(), CHAIN_ID).await?;
-    let sender = Arc::new(Sender::new(chain.clone(), sender_addr).await?);
+    let sender = Arc::new(Sender::new(Arc::new(chain.clone()), sender_addr).await?);
 
     // Spawn a new task for continuous message sending
     let sender_clone = sender.clone();
@@ -61,18 +59,17 @@ async fn main() -> Result<(), Error> {
 
 
 async fn continuous_send(addr: Address, sender: Arc<Sender>, chain: Chain) -> Result<(), Error> {
-    let mut rng = StdRng::from_entropy();
     loop {
         // Send a new message
         sender.add_message(Message {
             to: Some(Address::default()),
-            gas: 21_000u128,
+            gas: 21_000u64,
             value: U256::from(1_000_000u64), // 1 gwei
             ..Default::default()
         }).await;
 
         // Generate a random delay between 500ms and 1s
-        let delay = rng.gen_range(20..200);
+        let delay = rand::random_range(20..200);
         sleep(Duration::from_millis(delay)).await;
 
         // Print some status info

@@ -1,9 +1,10 @@
-use crate::{chain, chain::Chain, Error, GasPriceManager, Message, NonceManager, PriorityQueue};
+//! Transaction orchestrator. See [`Sender`].
+
+use crate::{chain, chain::ChainClient, Error, GasPriceManager, Message, NonceManager, PriorityQueue};
 use alloy::consensus::TxEip1559;
 use alloy::network::Ethereum;
 use alloy::primitives::{TxHash, TxKind};
 use alloy::providers::PendingTransactionBuilder;
-use alloy::pubsub::PubSubFrontend;
 use alloy::transports::RpcError::ErrorResp;
 use alloy::{
     primitives::{Address, B256},
@@ -15,11 +16,19 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::{Mutex, Semaphore};
 
+/// Maximum number of transactions that may be in-flight simultaneously.
 const MAX_IN_FLIGHT_TRANSACTIONS: usize = 16;
+
+/// Maximum number of times a stuck transaction may be replaced with a higher fee.
 const MAX_REPLACEMENTS: u32 = 3;
+
+/// Percentage by which the priority fee is increased on each replacement.
 const GAS_PRICE_INCREASE_PERCENT: u8 = 20;
+
+/// Seconds to wait for a transaction to confirm before treating it as dropped.
 const TX_TIMEOUT: u64 = 3;
 
+/// JSON-RPC error code returned when the sender has insufficient funds.
 const TX_FAILURE_INSUFFICIENT_FUNDS: i64 = -32003;
 
 type PendingMap = HashMap<TxHash, PendingTransaction>;
@@ -35,9 +44,23 @@ struct PendingTransaction {
     nonce: u64,
 }
 
+/// An orchestrator that manages concurrent EIP-1559 transaction submission.
+///
+/// [`Sender`] owns the priority queue, the in-flight pending map, and all
+/// shared resources (nonce manager, gas-price manager, semaphore).
+/// Callers add [`Message`] values via [`add_message`] and then drive
+/// processing by calling [`run`], which blocks until an unrecoverable error
+/// occurs.
+///
+/// Up to 16 messages are processed concurrently. Each message is handled in
+/// its own spawned task. A semaphore prevents the queue from being consumed
+/// faster than the concurrency limit allows.
+///
+/// [`add_message`]: Self::add_message
+/// [`run`]: Self::run
 #[derive(Clone)]
 pub struct Sender {
-    chain: Chain,
+    chain: Arc<dyn ChainClient>,
     nonce_manager: Arc<NonceManager>,
     gas_manager: Arc<GasPriceManager>,
 
@@ -47,7 +70,11 @@ pub struct Sender {
 }
 
 impl Sender {
-    pub async fn new(chain: Chain, address: Address) -> Result<Self, Error> {
+    /// Creates a new [`Sender`] connected to `chain` and bound to `address`.
+    ///
+    /// `address` is used to fetch the initial nonce and to sync nonces on
+    /// each new block. It must correspond to the signing key held by `chain`.
+    pub async fn new(chain: Arc<dyn ChainClient>, address: Address) -> Result<Self, Error> {
         Ok(Self {
             chain: chain.clone(),
             nonce_manager: Arc::new(NonceManager::new(chain.clone(), address).await?),
@@ -59,11 +86,20 @@ impl Sender {
         })
     }
 
+    /// Enqueues `msg` for processing on the next available concurrency slot.
     pub async fn add_message(&self, msg: Message) {
-        debug!("adding message {} {}", msg.to.unwrap(), msg.value.to_string());
+        debug!("adding message {} {}", msg.to.unwrap(), msg.value);
         self.queue.lock().await.push(msg)
     }
 
+    /// Drives the transaction send loop until an unrecoverable error occurs.
+    ///
+    /// [`run`] subscribes to new block headers and processes messages from the
+    /// priority queue. On each new block the nonce is re-synced with the chain.
+    /// When a concurrency slot is free, the highest-priority queued message is
+    /// popped and processed in a spawned task.
+    ///
+    /// [`run`]: Self::run
     pub async fn run(&self) -> Result<(), Error> {
         let mut block_stream = self.chain.subscribe_new_blocks().await?;
 
@@ -72,14 +108,18 @@ impl Sender {
                 biased;
 
                 block = block_stream.recv() => {
-                    if let Err(e) = block {
-                        error!("Error receiving block notification: {:?}", e);
-                        continue
+                    match block {
+                        Some(header) => {
+                            debug!("Received new block notification {}", header.inner.number);
+                            // Every block re-sync our nonce
+                            self.nonce_manager.sync_nonce().await?
+                        }
+                        None => {
+                            return Err(Error::ChainError(chain::Error::Subscription(
+                                "block stream closed unexpectedly".to_string(),
+                            )));
+                        }
                     }
-                    debug!("Received new block notification {}", block.unwrap().header.number.unwrap());
-
-                    // Every block re-sync our nonce
-                    self.nonce_manager.sync_nonce().await?
                 }
 
                 _ = self.process_next_message() => {}
@@ -87,15 +127,22 @@ impl Sender {
         }
     }
 
+    /// Acquires a concurrency slot, then pops and dispatches the next message.
+    ///
+    /// If the queue is empty, this method releases the slot and yields to the
+    /// executor before returning, avoiding a tight busy-loop.
     async fn process_next_message(&self) {
         // Block until we have a slot available
         let permit = self.max_in_flight.clone().acquire_owned().await.unwrap();
 
         // Now see if there are any messages
         if let Some(msg) = self.queue.lock().await.pop() {
-            // We have a message, process it in a separate task
+            // We have a message, process it in a separate task.
+            // The permit is moved into the task so it is held for the full
+            // duration of process_message, enforcing MAX_IN_FLIGHT_TRANSACTIONS.
             let sender = self.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(Error::ChainError(chain::Error::Rpc(ErrorResp(e)))) = sender.process_message(msg).await {
                     if e.code == TX_FAILURE_INSUFFICIENT_FUNDS {
                         error!("Insufficient funds to send transaction; dropping message");
@@ -109,8 +156,10 @@ impl Sender {
         }
     }
 
+    /// Validates and sends a single message, binding its nonce and gas prices
+    /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
-        debug!("processing message {} {}", msg.to.unwrap(), msg.value.to_string());
+        debug!("processing message {} {}", msg.to.unwrap(), msg.value);
 
         // First ensure the message is still valid
         if msg.is_expired() {
@@ -127,6 +176,13 @@ impl Sender {
         Ok(())
     }
 
+    /// Builds, signs, and broadcasts a transaction, then watches for confirmation.
+    ///
+    /// On confirmation, this method updates the nonce and gas-price trackers.
+    /// On timeout or drop, it delegates to [`handle_transaction_dropped`] which
+    /// may bump the fee and retry up to [`MAX_REPLACEMENTS`] times.
+    ///
+    /// [`handle_transaction_dropped`]: Self::handle_transaction_dropped
     async fn send_transaction(
         &self,
         msg: Message,
@@ -215,7 +271,8 @@ impl Sender {
         }).await
     }
 
-    async fn watch_transaction<'a>(&self, watcher: PendingTransactionBuilder<'a, PubSubFrontend, Ethereum>) -> Result<TxHash, Error> {
+    /// Registers a confirmation watcher with a [`TX_TIMEOUT`]-second deadline.
+    async fn watch_transaction(&self, watcher: PendingTransactionBuilder<Ethereum>) -> Result<TxHash, Error> {
         // Configure the watcher
         let pending = watcher
             .with_required_confirmations(1)
@@ -226,6 +283,12 @@ impl Sender {
         Ok(pending.await?)
     }
 
+    /// Handles a confirmed transaction - updates the gas and nonce trackers.
+    ///
+    /// If the receipt indicates a revert, this method delegates to
+    /// [`handle_transaction_dropped`] for retry handling.
+    ///
+    /// [`handle_transaction_dropped`]: Self::handle_transaction_dropped
     async fn handle_transaction_receipt(
         &self,
         tx_hash: B256,
@@ -249,18 +312,27 @@ impl Sender {
         }
     }
 
+    /// Handles a dropped or timed-out transaction.
+    ///
+    /// If the message has retries remaining, this method attempts to replace
+    /// the transaction with a higher priority fee via [`bump_transaction_fee`].
+    /// If retries are exhausted, the message is abandoned and logged.
+    ///
+    /// [`bump_transaction_fee`]: Self::bump_transaction_fee
     async fn handle_transaction_dropped(&self, tx_hash: B256) {
-        let mut pending = self.pending.lock().await;
-        let mut pending_tx = match pending.remove(&tx_hash) {
-            Some(tx) => tx,
-            None => {
-                println!(
-                    "Transaction {} not found in in-flight pending map",
-                    tx_hash
-                );
-                return;
+        let mut pending_tx = {
+            let mut pending = self.pending.lock().await;
+            match pending.remove(&tx_hash) {
+                Some(tx) => tx,
+                None => {
+                    println!(
+                        "Transaction {} not found in in-flight pending map",
+                        tx_hash
+                    );
+                    return;
+                }
             }
-        };
+        }; // lock released here, before any await
 
         // If we have retries left then attempt to bump the the fee
         if pending_tx.msg.increment_retry() {
@@ -278,6 +350,8 @@ impl Sender {
         );
     }
 
+    /// Re-sends a dropped transaction at the same nonce with a
+    /// [`GAS_PRICE_INCREASE_PERCENT`]% higher priority fee.
     async fn bump_transaction_fee(
         &self,
         tx_hash: B256,
@@ -285,7 +359,7 @@ impl Sender {
     ) -> Result<(), Error> {
         // Decide new fees
         let base_fee = self.gas_manager.get_base_fee().await;
-        let new_priority = percent_change(pending_tx.priority_fee, GAS_PRICE_INCREASE_PERCENT);
+        let new_priority = bump_by_percent(pending_tx.priority_fee, GAS_PRICE_INCREASE_PERCENT);
 
         // Remove existing transaction
         self.pending.lock().await.remove(&tx_hash);
@@ -302,6 +376,6 @@ impl Sender {
     }
 }
 
-fn percent_change(n: u128, percent: u8) -> u128 {
-    n * percent as u128 / 100
+fn bump_by_percent(n: u128, percent: u8) -> u128 {
+    n + n * percent as u128 / 100
 }
