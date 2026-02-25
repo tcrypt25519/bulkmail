@@ -1,0 +1,107 @@
+name: Create v1 Issues
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-issues:
+    name: Create milestone and issues
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Create v1 milestone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Create the v1 milestone (ignore error if it already exists)
+          gh api repos/$GH_REPO/milestones \
+            --method POST \
+            -f title="v1" \
+            -f state="open" || true
+
+          # Get the milestone number
+          MILESTONE=$(gh api repos/$GH_REPO/milestones | jq '.[] | select(.title=="v1") | .number')
+          echo "MILESTONE_NUMBER=$MILESTONE" >> $GITHUB_ENV
+
+      - name: Create issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          MILESTONE_NUMBER: ${{ env.MILESTONE_NUMBER }}
+        run: |
+          create_issue() {
+            local title="$1"
+            local body="$2"
+            gh api repos/$GH_REPO/issues \
+              --method POST \
+              -f title="$title" \
+              -f body="$body" \
+              -F milestone=$MILESTONE_NUMBER
+          }
+
+          create_issue \
+            "Handle malformed transactions" \
+            "## Problem
+          Correct code should never form a malformed transaction; making it the easiest to deal with.
+
+          ## Strategy
+          Use strongly typed code and tests to ensure well-formed transactions."
+
+          create_issue \
+            "Handle gas price too low" \
+            "## Problem
+          A common issue. The trickiest part of solving this is ensuring the gas isn't dramatically higher than necessary.
+
+          ## Strategy
+          Monitor the chain's base fee and congestion levels, and adjust the gas price accordingly."
+
+          create_issue \
+            "Handle insufficient funds" \
+            "## Problem
+          Largely application dependent, however all systems need to ensure they have enough funds to cover the transaction.
+
+          ## Note
+          Managing funds is outside the scope of this system for now."
+
+          create_issue \
+            "Handle nonce too low" \
+            "## Problem
+          Either this transaction has already landed or we're incorrectly reusing an old nonce.
+
+          ## Strategy
+          Track the confirmed and in-flight nonces combined with deferring binding nonces to messages until right before sending."
+
+          create_issue \
+            "Handle nonce too high" \
+            "## Problem
+          We've missed a transaction or one of our transactions is unconfirmed (possibly stuck or dropped).
+
+          ## Strategy
+          Track the confirmed and in-flight nonces and back-fill any gaps caused by dropped transactions."
+
+          create_issue \
+            "Handle reverted transactions" \
+            "## Problem
+          Either a bug in the code or an unexpected state change in the chain.
+
+          ## Strategy
+          Retry failed transactions up to a maximum number of times and then log failures for further investigation."
+
+          create_issue \
+            "Handle gas limit too low" \
+            "## Problem
+          The transaction is too complex for the gas limit provided.
+
+          ## Strategy
+          Increase the gas limit and retry the transaction up to a maximum number of times. A future enhancement could be to estimate the gas limit by simulating the transaction against the RPC."
+
+          create_issue \
+            "Handle dropped transactions" \
+            "## Problem
+          The transaction was dropped by the network.
+
+          ## Strategy
+          Retry failed transactions up to a maximum number of times."
