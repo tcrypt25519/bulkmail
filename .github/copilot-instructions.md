@@ -34,5 +34,5 @@
 ## Known errors/workarounds observed during onboarding
 - Local run of `cargo nextest run` failed with `error: no such command: nextest` (tool not installed in this environment).
   - Workaround used: run `cargo test` locally, or install nextest first (`cargo install cargo-nextest`) to match CI.
-- GitHub Actions run `22420197025` returned `conclusion: action_required` with `0` jobs, and fetching run logs URL returned `404`.
+- A GitHub Actions run returned `conclusion: action_required` with `0` jobs, and fetching run logs URL returned `404`.
   - Workaround used: validate locally with `cargo build`, `cargo test`, and `cargo clippy` until the workflow can execute jobs.
