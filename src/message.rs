@@ -252,15 +252,7 @@ mod tests {
 
     #[test]
     fn test_new_accepts_priority_at_max() {
-        let msg = Message::new(
-            None,
-            21_000,
-            U256::ZERO,
-            Default::default(),
-            MAX_PRIORITY,
-            None,
-            0,
-        );
+        let msg = Message::new(None, 21_000, U256::ZERO, Default::default(), MAX_PRIORITY, None, 0);
         assert_eq!(msg.priority, MAX_PRIORITY);
     }
 
@@ -312,15 +304,7 @@ mod tests {
     fn test_deadline_factor_none_when_far_away() {
         // 11 blocks remaining > DEADLINE_BOOST_FAR_BLOCKS (10).
         let far_ms = DEADLINE_BOOST_FAR_BLOCKS * BLOCK_TIME_MS + BLOCK_TIME_MS; // 11 blocks
-        let msg = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some(far_ms as u32),
-            0,
-        );
+        let msg = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some(far_ms as u32), 0);
         assert_eq!(msg.deadline_factor(0), None);
     }
 
@@ -328,15 +312,7 @@ mod tests {
     fn test_deadline_factor_max_when_near() {
         // 1 block remaining < DEADLINE_BOOST_NEAR_BLOCKS (2).
         let near_ms = DEADLINE_BOOST_NEAR_BLOCKS * BLOCK_TIME_MS - 1; // just under 2 blocks
-        let msg = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some(near_ms as u32),
-            0,
-        );
+        let msg = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some(near_ms as u32), 0);
         assert_eq!(msg.deadline_factor(0), Some(MAX_PRIORITY));
     }
 
@@ -346,44 +322,17 @@ mod tests {
         // dist_from_near = 6 - 2 = 4, range = 10 - 2 = 8.
         // boost = 100 - (100 - 33) * 4 / 8 = 100 - 67*4/8 = 100 - 33 = 67.
         let mid_ms = 6 * BLOCK_TIME_MS;
-        let msg = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some(mid_ms as u32),
-            0,
-        );
+        let msg = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some(mid_ms as u32), 0);
         let factor = msg.deadline_factor(0).unwrap();
-        assert!(
-            factor > MAX_PRIORITY / 3,
-            "boost should be above the minimum"
-        );
+        assert!(factor > MAX_PRIORITY / 3, "boost should be above the minimum");
         assert!(factor < MAX_PRIORITY, "boost should be below the maximum");
     }
 
     #[test]
     fn test_deadline_factor_increases_as_deadline_approaches() {
         // At 9 blocks remaining, boost should be lower than at 3 blocks remaining.
-        let msg9 = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some((9 * BLOCK_TIME_MS) as u32),
-            0,
-        );
-        let msg3 = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some((3 * BLOCK_TIME_MS) as u32),
-            0,
-        );
+        let msg9 = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some((9 * BLOCK_TIME_MS) as u32), 0);
+        let msg3 = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some((3 * BLOCK_TIME_MS) as u32), 0);
         let boost9 = msg9.deadline_factor(0).unwrap();
         let boost3 = msg3.deadline_factor(0).unwrap();
         assert!(boost3 > boost9, "closer deadline must yield a higher boost");
@@ -418,15 +367,7 @@ mod tests {
         use crate::clock::Clock;
         let clock = ManualClock::new(1_000_000);
         let deadline_ms: u32 = 5_000; // 5 seconds
-        let msg = Message::new(
-            None,
-            0,
-            U256::ZERO,
-            Default::default(),
-            0,
-            Some(deadline_ms),
-            clock.now_ms(),
-        );
+        let msg = Message::new(None, 0, U256::ZERO, Default::default(), 0, Some(deadline_ms), clock.now_ms());
 
         // Not yet expired
         assert!(!msg.is_expired(clock.now_ms()));
@@ -457,14 +398,14 @@ mod tests {
         assert_eq!(msg.deadline_factor(clock.now_ms()), None);
 
         // Advance to leave only 5 blocks remaining → linear boost zone
-        clock.advance(15 * BLOCK_TIME_MS);
+        clock.advance((15 * BLOCK_TIME_MS) as u64);
         let factor = msg.deadline_factor(clock.now_ms());
         assert!(factor.is_some(), "expected a boost at 5 blocks remaining");
         assert!(factor.unwrap() > MAX_PRIORITY / 3);
         assert!(factor.unwrap() < MAX_PRIORITY);
 
         // Advance to leave only 1 block remaining → maximum boost
-        clock.advance(4 * BLOCK_TIME_MS);
+        clock.advance((4 * BLOCK_TIME_MS) as u64);
         assert_eq!(msg.deadline_factor(clock.now_ms()), Some(MAX_PRIORITY));
     }
 
@@ -509,41 +450,15 @@ mod tests {
             expected: u32,
         }
         let cases = [
-            Case {
-                priority: 0,
-                retries: 0,
-                age_ms: 0,
-                expected: 0,
-            },
-            Case {
-                priority: 5,
-                retries: 0,
-                age_ms: 0,
-                expected: 5,
-            },
-            Case {
-                priority: 5,
-                retries: 2,
-                age_ms: 0,
-                expected: 7,
-            },
+            Case { priority: 0, retries: 0, age_ms: 0, expected: 0 },
+            Case { priority: 5, retries: 0, age_ms: 0, expected: 5 },
+            Case { priority: 5, retries: 2, age_ms: 0, expected: 7 },
             // 2 blocks of age = 4_000 ms → age_factor = 2
-            Case {
-                priority: 5,
-                retries: 0,
-                age_ms: 4_000,
-                expected: 7,
-            },
-            Case {
-                priority: 5,
-                retries: 1,
-                age_ms: 4_000,
-                expected: 8,
-            },
+            Case { priority: 5, retries: 0, age_ms: 4_000, expected: 7 },
+            Case { priority: 5, retries: 1, age_ms: 4_000, expected: 8 },
         ];
         for c in &cases {
-            let mut msg =
-                Message::new(None, 0, U256::ZERO, Default::default(), c.priority, None, 0);
+            let mut msg = Message::new(None, 0, U256::ZERO, Default::default(), c.priority, None, 0);
             for _ in 0..c.retries {
                 msg.increment_retry();
             }
@@ -551,9 +466,7 @@ mod tests {
                 msg.effective_priority(c.age_ms),
                 c.expected,
                 "priority={} retries={} age_ms={}",
-                c.priority,
-                c.retries,
-                c.age_ms
+                c.priority, c.retries, c.age_ms
             );
         }
     }
@@ -567,60 +480,20 @@ mod tests {
             expected: bool,
         }
         let cases = [
-            Case {
-                created_at_ms: 0,
-                deadline_ms: None,
-                now_ms: 9999,
-                expected: false,
-            },
-            Case {
-                created_at_ms: 0,
-                deadline_ms: Some(1000),
-                now_ms: 999,
-                expected: false,
-            },
-            Case {
-                created_at_ms: 0,
-                deadline_ms: Some(1000),
-                now_ms: 1000,
-                expected: true,
-            },
-            Case {
-                created_at_ms: 0,
-                deadline_ms: Some(1000),
-                now_ms: 2000,
-                expected: true,
-            },
-            Case {
-                created_at_ms: 5000,
-                deadline_ms: Some(3000),
-                now_ms: 7999,
-                expected: false,
-            },
-            Case {
-                created_at_ms: 5000,
-                deadline_ms: Some(3000),
-                now_ms: 8000,
-                expected: true,
-            },
+            Case { created_at_ms: 0, deadline_ms: None,       now_ms: 9999,  expected: false },
+            Case { created_at_ms: 0, deadline_ms: Some(1000), now_ms: 999,   expected: false },
+            Case { created_at_ms: 0, deadline_ms: Some(1000), now_ms: 1000,  expected: true  },
+            Case { created_at_ms: 0, deadline_ms: Some(1000), now_ms: 2000,  expected: true  },
+            Case { created_at_ms: 5000, deadline_ms: Some(3000), now_ms: 7999, expected: false },
+            Case { created_at_ms: 5000, deadline_ms: Some(3000), now_ms: 8000, expected: true  },
         ];
         for c in &cases {
-            let msg = Message::new(
-                None,
-                0,
-                U256::ZERO,
-                Default::default(),
-                0,
-                c.deadline_ms,
-                c.created_at_ms,
-            );
+            let msg = Message::new(None, 0, U256::ZERO, Default::default(), 0, c.deadline_ms, c.created_at_ms);
             assert_eq!(
                 msg.is_expired(c.now_ms),
                 c.expected,
                 "created_at={} deadline={:?} now={}",
-                c.created_at_ms,
-                c.deadline_ms,
-                c.now_ms
+                c.created_at_ms, c.deadline_ms, c.now_ms
             );
         }
     }
