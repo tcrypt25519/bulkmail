@@ -49,18 +49,17 @@ impl NonceManager {
     /// This method holds both locks atomically for the duration of the
     /// assignment to prevent two concurrent tasks from receiving the same nonce.
     pub async fn get_next_available_nonce(&self) -> u64 {
-        let mut current_nonce = self.current_nonce.lock().await;
+        let current_nonce = self.current_nonce.lock().await;
         let mut in_flight_nonces = self.in_flight_nonces.lock().await;
 
-        // Find the first non-used nonce
-        while in_flight_nonces.contains(&current_nonce) {
-            *current_nonce += 1;
+        // Walk forward from the confirmed baseline using a local counter so
+        // that the confirmed-nonce field is never mutated here.
+        let mut nonce = *current_nonce;
+        while in_flight_nonces.contains(&nonce) {
+            nonce += 1;
         }
 
-        let nonce = *current_nonce;
-        // *current_nonce += 1;
         in_flight_nonces.insert(nonce);
-
         nonce
     }
 
