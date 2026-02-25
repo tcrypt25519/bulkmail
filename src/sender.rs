@@ -11,10 +11,12 @@ use alloy::{
     rpc::types::TransactionReceipt,
 };
 use futures::future::join;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc, time::Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// Maximum number of transactions that may be in-flight simultaneously.
 const MAX_IN_FLIGHT_TRANSACTIONS: usize = 16;
@@ -67,6 +69,12 @@ pub struct Sender {
     queue: SharedQueue,
     pending: SharedPendingMap,
     max_in_flight: Arc<Semaphore>,
+    /// Notified by [`add_message`] so that [`process_next_message`] can sleep
+    /// instead of spinning when the queue is empty.
+    ///
+    /// [`add_message`]: Self::add_message
+    /// [`process_next_message`]: Self::process_next_message
+    message_ready: Arc<Notify>,
 }
 
 impl Sender {
@@ -83,13 +91,15 @@ impl Sender {
             queue: Arc::new(Mutex::new(PriorityQueue::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             max_in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TRANSACTIONS)),
+            message_ready: Arc::new(Notify::new()),
         })
     }
 
     /// Enqueues `msg` for processing on the next available concurrency slot.
     pub async fn add_message(&self, msg: Message) {
-        debug!("adding message {} {}", msg.to.unwrap(), msg.value);
-        self.queue.lock().await.push(msg)
+        debug!("adding message {:?} {}", msg.to, msg.value);
+        self.queue.lock().await.push(msg);
+        self.message_ready.notify_one();
     }
 
     /// Drives the transaction send loop until an unrecoverable error occurs.
@@ -150,16 +160,16 @@ impl Sender {
                 }
             });
         } else {
-            // No messages, release the permit and yield
+            // No messages; release the permit and sleep until add_message wakes us.
             drop(permit);
-            tokio::task::yield_now().await;
+            self.message_ready.notified().await;
         }
     }
 
     /// Validates and sends a single message, binding its nonce and gas prices
     /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
-        debug!("processing message {} {}", msg.to.unwrap(), msg.value);
+        debug!("processing message {:?} {}", msg.to, msg.value);
 
         // First ensure the message is still valid
         if msg.is_expired() {
@@ -183,14 +193,14 @@ impl Sender {
     /// may bump the fee and retry up to [`MAX_REPLACEMENTS`] times.
     ///
     /// [`handle_transaction_dropped`]: Self::handle_transaction_dropped
-    async fn send_transaction(
+    fn send_transaction(
         &self,
         msg: Message,
         nonce: u64,
         base_fee: u128,
         priority_fee: u128,
         replacement_count: u32,
-    ) -> Result<(), Error> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + '_>> {
         Box::pin(async move {
             // Ensure the message is still valid
             if msg.is_expired() {
@@ -268,7 +278,7 @@ impl Sender {
                 }
             };
             Ok(())
-        }).await
+        })
     }
 
     /// Registers a confirmation watcher with a [`TX_TIMEOUT`]-second deadline.
@@ -325,10 +335,7 @@ impl Sender {
             match pending.remove(&tx_hash) {
                 Some(tx) => tx,
                 None => {
-                    println!(
-                        "Transaction {} not found in in-flight pending map",
-                        tx_hash
-                    );
+                    warn!("Transaction {} not found in in-flight pending map", tx_hash);
                     return;
                 }
             }
@@ -337,17 +344,14 @@ impl Sender {
         // If we have retries left then attempt to bump the the fee
         if pending_tx.msg.increment_retry() {
             if let Err(e) = self.bump_transaction_fee(tx_hash, pending_tx).await {
-                println!("Failed to replace transaction: {:?}", e);
+                error!("Failed to replace transaction: {:?}", e);
             }
             return;
         }
 
         // No retries left so log this and abandon
         // TODO: Make requeue to try again later?
-        println!(
-            "Message for transaction {:?} failed after max retries",
-            tx_hash
-        );
+        error!("Message for transaction {:?} failed after max retries", tx_hash);
     }
 
     /// Re-sends a dropped transaction at the same nonce with a
@@ -360,9 +364,6 @@ impl Sender {
         // Decide new fees
         let base_fee = self.gas_manager.get_base_fee().await;
         let new_priority = bump_by_percent(pending_tx.priority_fee, GAS_PRICE_INCREASE_PERCENT);
-
-        // Remove existing transaction
-        self.pending.lock().await.remove(&tx_hash);
 
         // Send the same msg at the same nonce, with new fees and an incremented replacement_count
         self.send_transaction(
@@ -472,12 +473,24 @@ mod tests {
     // ── process_next_message() ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_process_next_message_returns_quickly_with_empty_queue() {
-        let sender = make_sender(base_mock()).await;
-        // With no messages, process_next_message should yield once and return.
-        tokio::time::timeout(Duration::from_millis(500), sender.process_next_message())
+    async fn test_process_next_message_blocks_when_queue_empty() {
+        // process_next_message must park at message_ready.notified() when the
+        // queue is empty, and resume promptly once add_message fires the notify.
+        let sender = Arc::new(make_sender(base_mock()).await);
+        let s = sender.clone();
+        let handle = tokio::spawn(async move { s.process_next_message().await });
+
+        // Yield so the spawned task can reach notified().await.
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished(), "should block when queue is empty");
+
+        // Firing the notify directly (no message needed — we just test the
+        // wake-up path; the empty-queue branch drops the permit and returns).
+        sender.message_ready.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), handle)
             .await
-            .expect("process_next_message blocked with an empty queue");
+            .expect("process_next_message did not unblock after notify")
+            .expect("task panicked");
     }
 
     #[tokio::test]
