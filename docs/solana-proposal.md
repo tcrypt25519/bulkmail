@@ -53,7 +53,7 @@ critical before designing the abstraction layer.
 ### 3.1 No Global Account Nonce
 
 Ethereum uses a per-account monotonic nonce to order transactions and prevent
-replays. Solana uses a **recent blockhash** (valid for ~150 slots / ~80 seconds)
+replays. Solana uses a **recent blockhash** (valid for ~150 slots / ~60 seconds)
 embedded in each transaction. There is no sequential ordering constraint — all
 transactions from the same account are independent.
 
@@ -205,11 +205,11 @@ pub trait ChainClient: Send + Sync {
     async fn get_block_number(&self) -> Result<u64, Error>;
 
     /// Send a fully-constructed, signed transaction and return
-    /// a handle to track its confirmation.
+    /// its identifier for tracking confirmation.
     async fn send_transaction(
         &self,
         tx: SignedTransaction,
-    ) -> Result<TransactionHandle, Error>;
+    ) -> Result<TransactionId, Error>;
 
     /// Check the confirmation status of a previously sent transaction.
     async fn get_transaction_status(
@@ -219,8 +219,8 @@ pub trait ChainClient: Send + Sync {
 }
 ```
 
-Where `SignedTransaction`, `TransactionHandle`, `TransactionId`, and
-`TransactionStatus` are enums dispatching to chain-specific types:
+Where `SignedTransaction`, `TransactionId`, and `TransactionStatus` are enums
+dispatching to chain-specific types:
 
 ```rust
 pub enum SignedTransaction {
@@ -296,8 +296,8 @@ congestion analysis pattern.
 pub trait SequenceManager: Send + Sync {
     /// Acquire sequencing state for a new transaction.
     /// On Ethereum: returns the next nonce.
-    /// On Solana: returns a recent blockhash.
-    async fn acquire(&self) -> SequenceToken;
+    /// On Solana: returns a recent blockhash (may require an RPC call).
+    async fn acquire(&self) -> Result<SequenceToken, Error>;
 
     /// Release sequencing state for a transaction that was not sent.
     /// On Ethereum: marks the nonce available for reuse.
@@ -474,8 +474,10 @@ struct BlockhashState {
 **Behavior:**
 
 - `acquire()` returns the cached blockhash. If the cached blockhash is older
-  than ~60 seconds (leaving 30s safety margin before the 90s expiry), it
-  fetches a fresh one first.
+  than ~45 seconds (leaving ~15s safety margin before the ~60s expiry, based on
+  ~150 slots at 400ms), it fetches a fresh one first. Returns
+  `Result<SequenceToken, Error>` so that RPC failures (network errors, node
+  unavailability) are properly propagated to the caller.
 - `release()` is a no-op (blockhashes are not exclusive).
 - `confirm()` is a no-op (no nonce to advance).
 - `sync()` is called each slot; refreshes the blockhash if approaching expiry.
@@ -538,6 +540,20 @@ pub enum TransactionPayload {
 }
 ```
 
+**Note:** At least one of the `ethereum` or `solana` features must be enabled;
+otherwise `TransactionPayload` (and similar enums like `FeeParams`,
+`SequenceToken`) would have no variants, causing a compilation error. The
+`default = ["ethereum"]` feature ensures this for the common case. When both
+features are enabled simultaneously (e.g., an application that bridges between
+chains), all variants are present and the `Sender` can be instantiated with
+either chain's implementations. A compile-time assertion should be added to
+emit a clear error message if neither feature is enabled:
+
+```rust
+#[cfg(not(any(feature = "ethereum", feature = "solana")))]
+compile_error!("At least one chain feature (\"ethereum\" or \"solana\") must be enabled.");
+```
+
 ---
 
 ## 6. Solana-Specific Considerations
@@ -586,7 +602,7 @@ The 400ms polling interval is appropriate for Solana's ~400ms slot time.
 ### 6.2 Transaction Timeout
 
 On Ethereum, `TX_TIMEOUT = 3s` is used. On Solana, transactions are naturally
-bounded by blockhash expiry (~80 seconds). However, we want faster feedback.
+bounded by blockhash expiry (~60 seconds). However, we want faster feedback.
 A reasonable Solana timeout is **15–30 seconds** — if a transaction hasn't
 confirmed by then, it's likely not going to be picked up by the current leader
 and should be retried with a fresh blockhash.
@@ -660,7 +676,14 @@ without changing external behavior.
    `Arc<dyn SequenceManager>` instead of the concrete types.
 5. Generalize the `ChainClient` trait (keep the existing Ethereum-specific
    methods behind a feature gate while adding the generic interface).
-6. Refactor `Message` to use `TransactionPayload`.
+6. Introduce `TransactionPayload` on `Message` in a backward-compatible way:
+   - Add a new `payload: Option<TransactionPayload>` field alongside the
+     existing public `to`, `value`, `data`, and `gas` fields.
+   - Update internal code paths to prefer `payload` when it is `Some`, while
+     continuing to support the existing fields so external callers are not
+     broken.
+   - Mark the old fields as `#[deprecated]` in the documentation and plan
+     their removal in a subsequent 0.2.x release.
 7. All existing tests pass without modification.
 
 **Estimated effort:** 2–3 days.
@@ -707,7 +730,7 @@ without changing external behavior.
 | Risk | Mitigation |
 |------|-----------|
 | **Solana SDK crate size** — `solana-sdk` pulls in many transitive dependencies | Feature gating ensures Ethereum-only users are unaffected |
-| **Blockhash expiry race** — Transaction built with a near-expiry blockhash | `BlockhashManager` enforces a 30-second safety margin; retries use fresh blockhashes |
+| **Blockhash expiry race** — Transaction built with a near-expiry blockhash | `BlockhashManager` enforces a ~15-second safety margin; retries use fresh blockhashes |
 | **Duplicate confirmations** — Both old and retried Solana transactions confirm | Track all signatures per message; accept first confirmation, ignore subsequent ones |
 | **Account contention** — Many transactions writing to the same account are serialized | Configurable concurrency cap; callers should batch instructions per-account |
 | **RPC rate limits** — High polling frequency for confirmations | Exponential backoff; configurable polling interval; batch `get_signature_statuses` calls |
@@ -756,4 +779,7 @@ The recommended Rust crates for the Solana implementation are:
 | `solana-transaction-status` | 2.2.x | Transaction status types and commitment level handling |
 
 The estimated total effort is **9–12 days** across four phases, with Phase 1
-(trait extraction) being fully non-breaking and independently shippable.
+(trait extraction) being backward-compatible and independently shippable.
+The existing public `Message` fields are preserved alongside the new
+`TransactionPayload` during Phase 1, with deprecation and removal deferred
+to a subsequent 0.2.x release.
