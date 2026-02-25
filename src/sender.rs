@@ -1,6 +1,7 @@
 //! Transaction orchestrator. See [`Sender`].
 
 use crate::{chain, chain::ChainClient, Error, GasPriceManager, Message, NonceManager, PriorityQueue};
+use crate::clock::{Clock, SystemClock};
 use alloy::consensus::TxEip1559;
 use alloy::network::Ethereum;
 use alloy::primitives::{TxHash, TxKind};
@@ -10,13 +11,13 @@ use alloy::{
     primitives::{Address, B256},
     rpc::types::TransactionReceipt,
 };
-use futures::future::join;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc, time::Instant};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 
 /// Maximum number of transactions that may be in-flight simultaneously.
 const MAX_IN_FLIGHT_TRANSACTIONS: usize = 16;
@@ -54,9 +55,10 @@ struct PendingTransaction {
 /// processing by calling [`run`], which blocks until an unrecoverable error
 /// occurs.
 ///
-/// Up to 16 messages are processed concurrently. Each message is handled in
-/// its own spawned task. A semaphore prevents the queue from being consumed
-/// faster than the concurrency limit allows.
+/// Up to [`MAX_IN_FLIGHT_TRANSACTIONS`] (16) messages are processed
+/// concurrently. Each message is handled in its own spawned task. A semaphore
+/// prevents the queue from being consumed faster than the concurrency limit
+/// allows.
 ///
 /// [`add_message`]: Self::add_message
 /// [`run`]: Self::run
@@ -96,9 +98,9 @@ impl Sender {
     }
 
     /// Enqueues `msg` for processing on the next available concurrency slot.
-    pub async fn add_message(&self, msg: Message) {
-        debug!("adding message {:?} {}", msg.to, msg.value);
-        self.queue.lock().await.push(msg);
+    pub fn add_message(&self, msg: Message) {
+        let now_ms = SystemClock.now_ms();
+        self.queue.lock().push(msg, now_ms);
         self.message_ready.notify_one();
     }
 
@@ -120,8 +122,7 @@ impl Sender {
                 block = block_stream.recv() => {
                     match block {
                         Some(header) => {
-                            debug!("Received new block notification {}", header.inner.number);
-                            // Every block re-sync our nonce
+                            info!("new block {}", header.inner.number);
                             self.nonce_manager.sync_nonce().await?
                         }
                         None => {
@@ -139,14 +140,19 @@ impl Sender {
 
     /// Acquires a concurrency slot, then pops and dispatches the next message.
     ///
-    /// If the queue is empty, this method releases the slot and yields to the
-    /// executor before returning, avoiding a tight busy-loop.
+    /// If the queue is empty, releases the slot and waits on [`message_ready`]
+    /// until [`add_message`] fires a notification.
+    ///
+    /// [`message_ready`]: Self::message_ready
+    /// [`add_message`]: Self::add_message
     async fn process_next_message(&self) {
         // Block until we have a slot available
         let permit = self.max_in_flight.clone().acquire_owned().await.unwrap();
 
-        // Now see if there are any messages
-        if let Some(msg) = self.queue.lock().await.pop() {
+        // Pop under a short-lived lock so no guard crosses an await point.
+        let msg = self.queue.lock().pop();
+
+        if let Some(msg) = msg {
             // We have a message, process it in a separate task.
             // The permit is moved into the task so it is held for the full
             // duration of process_message, enforcing MAX_IN_FLIGHT_TRANSACTIONS.
@@ -169,16 +175,16 @@ impl Sender {
     /// Validates and sends a single message, binding its nonce and gas prices
     /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
-        debug!("processing message {:?} {}", msg.to, msg.value);
+        let now_ms = SystemClock.now_ms();
 
         // First ensure the message is still valid
-        if msg.is_expired() {
+        if msg.is_expired(now_ms) {
             return Err(Error::MessageExpired);
         }
 
         // Get the next unscheduled nonce and initial gas prices
-        let nonce = self.nonce_manager.get_next_available_nonce().await;
-        let (base_fee, priority_fee) = self.gas_manager.get_gas_price(msg.effective_priority()).await?;
+        let nonce = self.nonce_manager.get_next_available_nonce();
+        let (base_fee, priority_fee) = self.gas_manager.get_gas_price(msg.effective_priority(now_ms))?;
 
         // Send transaction
         self.send_transaction(msg, nonce, base_fee, priority_fee, 0)
@@ -200,17 +206,19 @@ impl Sender {
         base_fee: u128,
         priority_fee: u128,
         replacement_count: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async move {
+            let now_ms = SystemClock.now_ms();
+
             // Ensure the message is still valid
-            if msg.is_expired() {
-                self.nonce_manager.mark_nonce_available(nonce).await;
+            if msg.is_expired(now_ms) {
+                self.nonce_manager.mark_nonce_available(nonce);
                 return Err(Error::MessageExpired);
             }
 
             // Ensure we haven't exceeded the maximum number of replacements
             if replacement_count > MAX_REPLACEMENTS {
-                self.nonce_manager.mark_nonce_available(nonce).await;
+                self.nonce_manager.mark_nonce_available(nonce);
                 return Err(Error::FeeIncreasesExceeded);
             }
 
@@ -225,7 +233,7 @@ impl Sender {
 
                 // Transaction wrapper fields
                 nonce,
-                gas_limit: msg.gas, // TODO: Sim for gas amount
+                gas_limit: msg.gas,
                 max_fee_per_gas: base_fee + priority_fee,
                 max_priority_fee_per_gas: priority_fee,
 
@@ -237,16 +245,16 @@ impl Sender {
             let watcher = match self.chain.send_transaction(tx).await {
                 Ok(w) => w,
                 Err(e) => {
-                    self.nonce_manager.mark_nonce_available(nonce).await;
+                    self.nonce_manager.mark_nonce_available(nonce);
                     return Err(Error::ChainError(e));
                 }
             };
 
             let tx_hash = *watcher.tx_hash();
-            info!("Sent transaction {:?} with nonce {}", tx_hash, nonce);
+            info!("sent transaction {:?} nonce={}", tx_hash, nonce);
 
             // Track the pending transaction
-            self.pending.lock().await.insert(tx_hash, PendingTransaction {
+            self.pending.lock().insert(tx_hash, PendingTransaction {
                 msg,
                 nonce,
                 priority_fee,
@@ -266,14 +274,14 @@ impl Sender {
 
                         // Error getting the receipt
                         Err(e) => {
-                            error!("error getting receipt: {}", e);
+                            error!("error getting receipt for {:?}: {}", tx_hash, e);
                             self.handle_transaction_dropped(tx_hash).await
                         }
                     };
                 }
                 // Transaction dropped
                 Err(e) => {
-                    error!("error building watcher: {}", e);
+                    error!("watcher error for {:?}: {}", tx_hash, e);
                     self.handle_transaction_dropped(tx_hash).await
                 }
             };
@@ -283,13 +291,10 @@ impl Sender {
 
     /// Registers a confirmation watcher with a [`TX_TIMEOUT`]-second deadline.
     async fn watch_transaction(&self, watcher: PendingTransactionBuilder<Ethereum>) -> Result<TxHash, Error> {
-        // Configure the watcher
         let pending = watcher
             .with_required_confirmations(1)
             .with_timeout(Some(Duration::from_secs(TX_TIMEOUT)))
             .register().await?;
-
-        // Wait for the watcher to confirm or timeout
         Ok(pending.await?)
     }
 
@@ -306,19 +311,16 @@ impl Sender {
     ) {
         // Handle reverts
         if !receipt.status() {
-            // TODO: Handle better
             self.handle_transaction_dropped(tx_hash).await;
             return;
         }
 
         // Transaction confirmed; remove it from pending and update the gas and nonce trackers
-        info!("Transaction {:?} confirmed", tx_hash);
-        if let Some(pending_tx) = self.pending.lock().await.remove(&tx_hash) {
+        info!("transaction {:?} confirmed", tx_hash);
+        if let Some(pending_tx) = self.pending.lock().remove(&tx_hash) {
             let latency = pending_tx.created_at.elapsed();
-            join(
-                self.gas_manager.update_on_confirmation(latency, receipt.effective_gas_price),
-                self.nonce_manager.update_current_nonce(pending_tx.nonce),
-            ).await;
+            self.gas_manager.update_on_confirmation(latency, receipt.effective_gas_price);
+            self.nonce_manager.update_current_nonce(pending_tx.nonce);
         }
     }
 
@@ -331,27 +333,25 @@ impl Sender {
     /// [`bump_transaction_fee`]: Self::bump_transaction_fee
     async fn handle_transaction_dropped(&self, tx_hash: B256) {
         let mut pending_tx = {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock();
             match pending.remove(&tx_hash) {
                 Some(tx) => tx,
                 None => {
-                    warn!("Transaction {} not found in in-flight pending map", tx_hash);
+                    warn!("transaction {} not found in pending map", tx_hash);
                     return;
                 }
             }
         }; // lock released here, before any await
 
-        // If we have retries left then attempt to bump the the fee
+        // If we have retries left then attempt to bump the fee
         if pending_tx.msg.increment_retry() {
             if let Err(e) = self.bump_transaction_fee(tx_hash, pending_tx).await {
-                error!("Failed to replace transaction: {:?}", e);
+                error!("failed to replace transaction {:?}: {:?}", tx_hash, e);
             }
             return;
         }
 
-        // No retries left so log this and abandon
-        // TODO: Make requeue to try again later?
-        error!("Message for transaction {:?} failed after max retries", tx_hash);
+        error!("message for transaction {:?} failed after max retries", tx_hash);
     }
 
     /// Re-sends a dropped transaction at the same nonce with a
@@ -361,11 +361,11 @@ impl Sender {
         tx_hash: B256,
         pending_tx: PendingTransaction,
     ) -> Result<(), Error> {
-        // Decide new fees
-        let base_fee = self.gas_manager.get_base_fee().await;
+        let base_fee = self.gas_manager.get_base_fee();
         let new_priority = bump_by_percent(pending_tx.priority_fee, GAS_PRICE_INCREASE_PERCENT);
 
-        // Send the same msg at the same nonce, with new fees and an incremented replacement_count
+        info!("replacing {:?} with priority_fee={}", tx_hash, new_priority);
+
         self.send_transaction(
             pending_tx.msg,
             pending_tx.nonce,
@@ -373,7 +373,7 @@ impl Sender {
             new_priority,
             pending_tx.replacement_count + 1,
         )
-            .await
+        .await
     }
 }
 
@@ -421,9 +421,6 @@ mod tests {
 
     #[test]
     fn test_bump_is_an_increase_not_a_fraction() {
-        // Regression: the original formula was `n * percent / 100` (20% OF n),
-        // which produced a replacement fee LOWER than the original.
-        // Correct formula: `n + n * percent / 100` (n bumped BY percent%).
         let fee: u128 = 1_000_000_000;
         let bumped = bump_by_percent(fee, 20);
         assert!(bumped > fee, "bumped fee must exceed the original");
@@ -435,23 +432,23 @@ mod tests {
     #[tokio::test]
     async fn test_new_has_empty_queue() {
         let sender = make_sender(base_mock()).await;
-        assert_eq!(sender.queue.lock().await.len(), 0);
+        assert_eq!(sender.queue.lock().len(), 0);
     }
 
     #[tokio::test]
     async fn test_add_message_enqueues() {
         let sender = make_sender(base_mock()).await;
-        sender.add_message(Message::default()).await;
-        assert_eq!(sender.queue.lock().await.len(), 1);
+        sender.add_message(Message::default());
+        assert_eq!(sender.queue.lock().len(), 1);
     }
 
     #[tokio::test]
     async fn test_add_multiple_messages() {
         let sender = make_sender(base_mock()).await;
         for _ in 0..4 {
-            sender.add_message(Message::default()).await;
+            sender.add_message(Message::default());
         }
-        assert_eq!(sender.queue.lock().await.len(), 4);
+        assert_eq!(sender.queue.lock().len(), 4);
     }
 
     // ── run() ────────────────────────────────────────────────────────────────
@@ -460,7 +457,6 @@ mod tests {
     async fn test_run_errors_when_block_stream_closes() {
         let mut mock = base_mock();
         mock.expect_subscribe_new_blocks().returning(|| {
-            // The sender half is dropped immediately, so the receiver is closed.
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         });
@@ -474,18 +470,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_next_message_blocks_when_queue_empty() {
-        // process_next_message must park at message_ready.notified() when the
-        // queue is empty, and resume promptly once add_message fires the notify.
         let sender = Arc::new(make_sender(base_mock()).await);
         let s = sender.clone();
         let handle = tokio::spawn(async move { s.process_next_message().await });
 
-        // Yield so the spawned task can reach notified().await.
         tokio::task::yield_now().await;
         assert!(!handle.is_finished(), "should block when queue is empty");
 
-        // Firing the notify directly (no message needed — we just test the
-        // wake-up path; the empty-queue branch drops the permit and returns).
         sender.message_ready.notify_one();
         tokio::time::timeout(Duration::from_millis(100), handle)
             .await
@@ -496,9 +487,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_next_message_pops_and_attempts_send() {
         let mut mock = base_mock();
-        // chain.id() is called to build the TxEip1559.
         mock.expect_id().returning(|| 1337u64);
-        // Inject a chain-level failure so we don't need a real provider.
         mock.expect_send_transaction().returning(|_| {
             Err(chain::Error::Subscription("injected".into()))
         });
@@ -507,14 +496,12 @@ mod tests {
         let mut msg = Message::default();
         msg.to = Some(Address::default());
         msg.gas = 21_000;
-        sender.add_message(msg).await;
-        assert_eq!(sender.queue.lock().await.len(), 1);
+        sender.add_message(msg);
+        assert_eq!(sender.queue.lock().len(), 1);
 
         sender.process_next_message().await;
-        // Give the spawned task time to run to completion.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // Message was popped regardless of the send outcome.
-        assert_eq!(sender.queue.lock().await.len(), 0);
+        assert_eq!(sender.queue.lock().len(), 0);
     }
 }

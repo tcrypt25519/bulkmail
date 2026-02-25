@@ -10,8 +10,6 @@ use tokio::time::sleep;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("hex decoding error: {0}")]
-    HexDecode(#[from] hex::FromHexError),
     #[error("transaction manager error: {0}")]
     TM(#[from] bulkmail::Error),
     #[error("chain error: {0}")]
@@ -65,7 +63,7 @@ async fn continuous_send(addr: Address, sender: Arc<Sender>, chain: Chain) -> Re
         msg.to = Some(Address::default());
         msg.gas = 21_000u64;
         msg.value = U256::from(1_000_000u64); // 1 gwei
-        sender.add_message(msg).await;
+        sender.add_message(msg);
 
         // Generate a random delay between 500ms and 1s
         let delay = rand::random_range(20..200);
