@@ -6,9 +6,9 @@ A parallel transaction sender for Ethereum, designed to handle concurrent transa
 
 ## Docs
 
-- [Design](docs/design.md)
-- [Diagram](docs/diagrams.md)
+- [Architecture](ARCHITECTURE.md)
 - [Problem Answers](docs/answers.md)
+- [Original Design Notes](docs/design.md) *(superseded by ARCHITECTURE.md)*
 
 ## Features
 
