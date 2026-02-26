@@ -4,11 +4,17 @@
 
 This proposal describes how to extend Bulkmail — currently an Ethereum-specific
 parallel transaction sender — to also support Solana while sharing as much
-infrastructure as possible. The design introduces a chain-agnostic core that
-retains the existing priority queue, concurrency management, retry logic, and
-deadline system, while allowing chain-specific modules to handle the fundamental
-differences in transaction construction, fee pricing, sequencing, and
-confirmation between Ethereum and Solana.
+infrastructure as possible. The design introduces a **generic adapter pattern**
+with chain-specific tag types, so that `Sender` is monomorphized per chain at
+compile time. The priority queue, concurrency management, retry budgets, and
+deadline system are chain-agnostic; chain-specific concerns (transaction
+building, fee pricing, replay protection, retry mechanics, and confirmation
+watching) are encapsulated behind associated types on a single `ChainAdapter`
+trait.
+
+The initial implementation uses enum-based dispatch internally for expedience,
+but the trait boundaries are designed so that generic associated types (GATs)
+can replace dynamic dispatch without any public API changes.
 
 ---
 
@@ -31,6 +37,7 @@ Key modules and their responsibilities:
 | `gas_price.rs` | EIP-1559 priority fee adaptation |
 | `chain.rs` | Concrete `Chain` struct wrapping Alloy WebSocket provider |
 | `lib.rs` | Public API, error types |
+| `bin/oracle.rs` | Simulation binary using Anvil (to be moved to `examples/`) |
 
 The existing `ChainClient` trait is the primary extension point — `Sender`
 already depends on `Arc<dyn ChainClient>`, not a concrete type. `NonceManager`
@@ -56,8 +63,10 @@ time but not block height; `lastValidBlockHeight` from the RPC is the
 authoritative expiry measure.
 
 **Implication:** The `NonceManager` concept does not apply to Solana. Instead,
-Solana requires a **blockhash manager** that fetches and caches recent
-blockhashes, refreshing them before they expire.
+Solana requires a **blockhash manager** that maintains a cache of recent
+blockhashes in memory, refreshing proactively so that transaction crafting
+never requires an RPC round-trip. The role is better described as **replay
+protection** rather than sequencing, since Solana imposes no ordering.
 
 Solana also offers **durable nonce accounts** for long-lived transactions, but
 these are not suitable for high-throughput sending: transactions are strictly
@@ -144,250 +153,378 @@ implementation already encapsulates signing, so this is a natural boundary.
 1. **Shared core, chain-specific edges.** The priority queue, concurrency
    management (semaphore), retry/deadline logic, and orchestrator loop are
    chain-agnostic and should be shared.
-2. **Trait-based polymorphism at the chain boundary.** Generalize `ChainClient`
-   and the fee/sequencing managers into traits that both Ethereum and Solana
-   implement.
+2. **Monomorphized adapter pattern.** A single `ChainAdapter` trait with
+   associated types groups all chain-specific components together. `Sender<A>`
+   is generic over the adapter, enabling zero-cost dispatch and type-safe
+   binding of all chain components via a tag type.
 3. **Feature-gated dependencies.** Use Cargo features (`ethereum`, `solana`)
    so users only pull in the dependencies they need.
 4. **No compromise on either chain's capabilities.** The abstraction should not
    prevent chain-specific optimizations (e.g., Solana's parallel execution,
    Ethereum's nonce replacement).
+5. **No RPC at transaction-packaging time.** Replay protection tokens (nonces,
+   blockhashes) and fee estimates must be available from in-memory state. RPC
+   calls happen asynchronously in background refresh loops, never in the hot
+   path of crafting a transaction.
 
 ### 4.2 Module Reorganization
 
 ```
 src/
-├── lib.rs                    # Public API, Error enum, feature gates
-├── message.rs                # Chain-agnostic Message (unchanged core)
-├── priority_queue.rs         # Chain-agnostic (unchanged)
-├── sender.rs                 # Chain-agnostic orchestrator (parameterized)
+├── lib.rs                        # Public API, Error enum, feature gates
+├── message.rs                    # Chain-agnostic Message (unchanged core)
+├── priority_queue.rs             # Chain-agnostic (unchanged)
+├── sender.rs                     # Sender<A: ChainAdapter> orchestrator
 │
-├── chain/
-│   ├── mod.rs                # ChainClient trait (generalized)
-│   ├── ethereum.rs           # Ethereum ChainClient (current chain.rs)
-│   └── solana.rs             # Solana ChainClient (new)
+├── adapter/
+│   ├── mod.rs                    # ChainAdapter trait + associated types
+│   ├── ethereum.rs               # adapters::Eth tag type + all ETH impls
+│   └── solana.rs                 # adapters::Sol tag type + all SOL impls
 │
-├── fee/
-│   ├── mod.rs                # FeeManager trait
-│   ├── ethereum.rs           # EIP-1559 GasPriceManager (current gas_price.rs)
-│   └── solana.rs             # Compute-unit priority fee manager (new)
-│
-├── sequencing/
-│   ├── mod.rs                # SequenceManager trait
-│   ├── ethereum.rs           # NonceManager (current nonce_manager.rs)
-│   └── solana.rs             # BlockhashManager (new)
-│
-└── bin/
-    ├── oracle.rs             # Ethereum oracle (current)
-    └── oracle_solana.rs      # Solana oracle (new, uses solana-test-validator)
+examples/
+├── oracle_eth.rs                 # Ethereum oracle (moved from bin/oracle.rs)
+└── oracle_sol.rs                 # Solana oracle (new, uses solana-test-validator)
 ```
 
-### 4.3 Core Trait Definitions
+The existing `chain.rs`, `gas_price.rs`, and `nonce_manager.rs` modules are
+absorbed into `adapter/ethereum.rs`. Their public interfaces are preserved as
+methods on the Ethereum adapter's associated types. The `bin/oracle.rs`
+simulation is moved to `examples/oracle_eth.rs` (it has always been an example
+in practice). A Solana equivalent is added as `examples/oracle_sol.rs`.
 
-#### 4.3.1 Generalized ChainClient
+### 4.3 The ChainAdapter Trait
 
-The current `ChainClient` trait is Ethereum-specific (returns `TxEip1559`,
-`PendingTransactionBuilder<Ethereum>`, etc.). We generalize it:
+Rather than three separate traits (`ChainClient`, `FeeManager`,
+`SequenceManager`) that must be manually kept in sync, a single `ChainAdapter`
+trait groups them as associated types:
 
 ```rust
-/// Chain-agnostic interface for submitting transactions and
-/// monitoring blocks/slots.
-#[async_trait]
-pub trait ChainClient: Send + Sync {
-    /// A chain-specific unique identifier (e.g. chain ID integer as string,
-    /// or cluster name such as "mainnet-beta").
-    fn chain_id(&self) -> String;
+/// The root abstraction that binds all chain-specific components together.
+///
+/// Each chain (Ethereum, Solana) provides a zero-sized tag type that
+/// implements this trait and specifies its associated types. `Sender<A>`
+/// is generic over this trait, so all chain components are statically
+/// bound and monomorphized at compile time.
+pub trait ChainAdapter: Send + Sync + 'static {
+    /// Chain-specific transaction payload (e.g., EIP-1559 fields or Solana
+    /// instructions).
+    type Payload: Send + Sync + Clone;
 
+    /// Chain-specific fee parameters.
+    type FeeParams: Send + Sync + Clone;
+
+    /// Chain-specific replay-protection token (nonce or blockhash).
+    type ReplayToken: Send + Sync + Clone;
+
+    /// Opaque transaction identifier returned after sending.
+    type TxId: Send + Sync + Clone;
+
+    /// The chain connection / RPC client.
+    type Client: ChainClient<Self> + Send + Sync;
+
+    /// Fee estimation and adaptation.
+    type FeeManager: FeeManager<Self> + Send + Sync;
+
+    /// Replay protection (nonce management or blockhash caching).
+    type ReplayProtection: ReplayProtection<Self> + Send + Sync;
+
+    /// Transaction retry / fee-bump strategy.
+    type RetryStrategy: RetryStrategy<Self> + Send + Sync;
+}
+```
+
+Pre-built adapters:
+
+```rust
+pub mod adapters {
+    /// Ethereum adapter tag. All ETH-specific types are associated here.
+    pub struct Eth;
+
+    /// Solana adapter tag. All SOL-specific types are associated here.
+    pub struct Sol;
+}
+```
+
+Usage:
+
+```rust
+// Ethereum
+let sender: Sender<adapters::Eth> = Sender::new(eth_client, eth_fees, eth_nonces, eth_retry);
+
+// Solana
+let sender: Sender<adapters::Sol> = Sender::new(sol_client, sol_fees, sol_blockhash, sol_retry);
+```
+
+The tag type carries no data — it exists only to lock all associated types
+together at the type level. This prevents accidentally mixing an Ethereum fee
+manager with a Solana client.
+
+### 4.4 Component Traits
+
+Each associated type on `ChainAdapter` implements a component trait. These
+traits use the adapter's associated types rather than enums, so there is no
+size overhead from mismatched variants.
+
+#### 4.4.1 ChainClient
+
+```rust
+#[async_trait]
+pub trait ChainClient<A: ChainAdapter>: Send + Sync {
     /// Subscribe to new block/slot notifications.
     async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error>;
 
-    /// Get the current block number (Ethereum) or confirmed block height
-    /// (Solana). For Solana this is distinct from slot number — only
-    /// produced blocks increment this counter.
+    /// Get the current block number (ETH) or confirmed block height (SOL).
     async fn get_block_number(&self) -> Result<u64, Error>;
 
-    /// Build, sign, and submit a transaction. The chain implementation owns
-    /// signing; callers pass chain-agnostic intent and the implementation
-    /// handles key material and serialization.
+    /// Build, sign, and submit a transaction.
     async fn send_transaction(
         &self,
-        payload: &TransactionPayload,
-        fee: FeeParams,
-        sequence: SequenceToken,
-    ) -> Result<TransactionId, Error>;
+        payload: &A::Payload,
+        fee: A::FeeParams,
+        replay_token: A::ReplayToken,
+    ) -> Result<A::TxId, Error>;
 
-    /// Check the confirmation status of a previously sent transaction.
+    /// Check confirmation status of a previously sent transaction.
     async fn get_transaction_status(
         &self,
-        id: TransactionId,
+        id: &A::TxId,
     ) -> Result<TransactionStatus, Error>;
 }
 ```
 
-`TransactionId` is an opaque 32-byte newtype — both Ethereum transaction hashes
-and Solana signatures are 32 bytes, so each chain implementation converts to
-and from its native type as needed:
-
-```rust
-/// Opaque transaction identifier. 32 bytes covers both Ethereum tx hashes
-/// (keccak256) and Solana signatures (Ed25519).
-pub struct TransactionId(pub [u8; 32]);
-```
-
-`TransactionStatus` uses only primitive types and is fully chain-agnostic:
+`TransactionStatus` is chain-agnostic and uses only primitive types:
 
 ```rust
 pub enum TransactionStatus {
     Pending,
-    Confirmed { slot_or_block: u64 },
-    Finalized { slot_or_block: u64 },
+    /// On Ethereum: the block number. On Solana: the slot number in which
+    /// the transaction was confirmed (which is the chronological measure
+    /// used by `get_signature_statuses`).
+    Confirmed { number: u64 },
+    Finalized { number: u64 },
     Failed { reason: String },
     Expired,
 }
 ```
 
-**Alternative (generic) approach:** The trait could be made generic over
-associated types. This would be more type-safe but less ergonomic for dynamic
-dispatch. Given that Bulkmail already uses `Arc<dyn ChainClient>`, the opaque
-newtype approach is recommended for consistency and simplicity.
-
-#### 4.3.2 FeeManager Trait
+#### 4.4.2 FeeManager
 
 ```rust
-/// Chain-agnostic fee computation.
 #[async_trait]
-pub trait FeeManager: Send + Sync {
-    /// Compute fee parameters for a transaction with the given
-    /// message priority (0–100).
-    ///
-    /// Returns an opaque `FeeParams` that the chain client knows how to apply.
-    async fn get_fee_params(&self, priority: u32) -> Result<FeeParams, Error>;
+pub trait FeeManager<A: ChainAdapter>: Send + Sync {
+    /// Compute fee parameters for a given message priority (0–100).
+    async fn get_fee_params(&self, priority: u32) -> Result<A::FeeParams, Error>;
 
-    /// Update internal estimates based on a confirmed transaction.
+    /// Record a confirmed transaction's latency and fee for adaptation.
     async fn update_on_confirmation(
         &self,
         confirmation_time: Duration,
-        fee_paid: FeeParams,
+        fee_paid: &A::FeeParams,
     );
 
-    /// Return the current base fee estimate (for fee bumping).
-    async fn get_base_fee(&self) -> FeeParams;
+    /// Bump fee params for a retry (e.g., +20%).
+    fn bump_fee(&self, current: &A::FeeParams) -> A::FeeParams;
 }
 ```
 
-Where `FeeParams` is:
+#### 4.4.3 ReplayProtection
 
 ```rust
-pub enum FeeParams {
-    /// EIP-1559: (base_fee_per_gas, max_priority_fee_per_gas)
-    Ethereum { base_fee: u128, priority_fee: u128 },
-    /// Solana: compute_unit_price in micro-lamports
-    Solana { compute_unit_price: u64, compute_unit_limit: u32 },
-}
-```
-
-The Ethereum `FeeManager` implementation is the existing `GasPriceManager`
-wrapped to produce `FeeParams::Ethereum`. The Solana implementation queries
-`getRecentPrioritizationFees` and adapts using the same rolling-window
-congestion analysis pattern.
-
-#### 4.3.3 SequenceManager Trait
-
-```rust
-/// Chain-agnostic transaction sequencing / replay protection.
 #[async_trait]
-pub trait SequenceManager: Send + Sync {
-    /// Get sequencing state for a new transaction — the next nonce on
-    /// Ethereum, or a recent blockhash on Solana (may require an RPC call).
-    async fn next(&self) -> Result<SequenceToken, Error>;
+pub trait ReplayProtection<A: ChainAdapter>: Send + Sync {
+    /// Get a replay-protection token for a new transaction.
+    /// Must be serviced from in-memory state — no RPC calls.
+    fn next(&self) -> A::ReplayToken;
 
-    /// Release sequencing state for a transaction that was not sent.
-    /// On Ethereum: marks the nonce available for reuse.
-    /// On Solana: no-op (blockhashes are not exclusive).
-    async fn release(&self, token: SequenceToken);
-
-    /// Notify the manager that a transaction has confirmed.
-    /// On Ethereum: advances the nonce baseline (anti-rollback: only
-    /// advances if the new value is strictly greater than the current one).
-    /// On Solana: no-op.
-    async fn confirm(&self, token: SequenceToken);
-
-    /// Sync with the chain (called on each new block).
+    /// Sync with the chain (called on each new block/slot notification).
+    /// This is where RPC calls to refresh state happen.
     async fn sync(&self) -> Result<(), Error>;
 }
 ```
 
-`SequenceToken` uses only primitive types so it requires no feature gating:
+Note the key differences from the previous `SequenceManager` design:
+
+- **Renamed** from "SequenceManager" to "ReplayProtection" because Solana
+  replay protection is explicitly not sequencing.
+- **`next()` is synchronous** — it reads from in-memory state only. Blockhash
+  acquisition is fully decoupled from transaction crafting. The `sync()` method
+  handles all RPC I/O in the background.
+- **No `release()` method** in the shared trait. On Ethereum, the nonce pool
+  is managed internally by the `EthReplayProtection` implementation; when a
+  transaction fails before broadcast, the implementation's own `release_nonce()`
+  method is called directly by the Ethereum retry strategy — not through the
+  generic trait.
+
+Ethereum implementation:
 
 ```rust
-pub enum SequenceToken {
-    Nonce(u64),
-    /// Raw 32-byte blockhash (chain-agnostic representation).
-    Blockhash([u8; 32]),
+/// Wraps the existing NonceManager. next() is infallible and in-memory.
+pub struct EthReplayProtection {
+    nonce_manager: NonceManager,
+}
+
+impl ReplayProtection<Eth> for EthReplayProtection {
+    fn next(&self) -> u64 {
+        self.nonce_manager.get_next_available_nonce()
+    }
+    async fn sync(&self) -> Result<(), Error> {
+        self.nonce_manager.sync_nonce().await
+    }
+}
+
+impl EthReplayProtection {
+    /// Ethereum-only: return a nonce to the available pool.
+    pub fn release_nonce(&self, nonce: u64) { ... }
+
+    /// Ethereum-only: advance the confirmed baseline.
+    pub fn confirm_nonce(&self, nonce: u64) { ... }
 }
 ```
 
-The Ethereum implementation wraps the existing `NonceManager`.
-`NonceManager::get_next_available_nonce()` returns a bare `u64` (infallible,
-pure in-memory); the wrapper returns `Ok(SequenceToken::Nonce(n))`. The
-Ethereum `SequenceManager` implementation holds its own provider reference for
-`sync()` — this keeps the `ChainClient` trait free of Ethereum-specific
-nonce-fetching methods. The Solana implementation caches the latest blockhash
-and refreshes it based on block height proximity to expiry (~150 blocks).
-
-### 4.4 Sender Changes
-
-The `Sender` is parameterized over the three traits rather than depending on
-concrete types. The core loop remains identical:
+Solana implementation:
 
 ```rust
-pub struct Sender {
-    chain: Arc<dyn ChainClient>,
-    sequencer: Arc<dyn SequenceManager>,
-    fee_manager: Arc<dyn FeeManager>,
-    // ... queue, pending, semaphore, message_ready (unchanged)
+/// Maintains a cache of recent blockhashes, refreshed proactively by sync().
+pub struct SolReplayProtection {
+    /// Most recent blockhash and its expiry block height.
+    state: Mutex<BlockhashState>,
+}
+
+struct BlockhashState {
+    blockhash: [u8; 32],
+    last_valid_block_height: u64,
+    /// Slot number at which this blockhash was fetched.
+    fetched_at_slot: u64,
+}
+
+impl ReplayProtection<Sol> for SolReplayProtection {
+    fn next(&self) -> [u8; 32] {
+        self.state.lock().blockhash
+    }
+    async fn sync(&self) -> Result<(), Error> {
+        // Fetch current block height; if remaining validity < half the
+        // window (~75 blocks), proactively refresh. The comparison is
+        // between current block height and `last_valid_block_height`,
+        // both of which are chain-reported values.
+        ...
+    }
 }
 ```
 
-The key change is in `send_transaction`: instead of building a `TxEip1559`
-directly, it delegates to a **transaction builder** function that the chain
-client provides (or that is selected based on the chain type).
+The half-window refresh threshold (~75 blocks out of the ~150 block validity
+window) ensures we never use a blockhash that's close to expiring, while also
+not over-fetching. The determination is based on the difference between the
+current block height and `last_valid_block_height` — both chain-reported
+values, not wall-clock time.
 
-#### Retry Logic Adaptation
+#### 4.4.4 RetryStrategy
 
-The retry flow must diverge based on the chain:
+```rust
+#[async_trait]
+pub trait RetryStrategy<A: ChainAdapter>: Send + Sync {
+    /// Handle a transaction that was dropped or timed out.
+    ///
+    /// The strategy decides whether to bump fees and resubmit,
+    /// re-queue the message, or abandon it.
+    async fn handle_dropped(
+        &self,
+        pending: &PendingTransaction<A>,
+        client: &A::Client,
+        fees: &A::FeeManager,
+        replay: &A::ReplayProtection,
+    ) -> RetryDecision<A>;
 
-| Scenario | Ethereum | Solana |
-|----------|----------|--------|
-| Transaction stuck | Replace at same nonce with +20% fee | Resubmit fresh transaction with new blockhash and higher priority fee |
-| Transaction dropped | Detected via timeout, replace | Detected via blockhash expiry or status polling; resubmit |
-| Max retries | Abandon message | Abandon message |
-| Fee bumping | `new_fee = fee + fee * 20%` | `new_cu_price = cu_price + cu_price * 20%` |
+    /// Handle a confirmed transaction.
+    async fn handle_confirmed(
+        &self,
+        pending: &PendingTransaction<A>,
+        fees: &A::FeeManager,
+        replay: &A::ReplayProtection,
+        confirmation_time: Duration,
+    );
+}
 
-The existing `handle_transaction_dropped` flow is modified to check the chain
-type:
+pub enum RetryDecision<A: ChainAdapter> {
+    /// Resubmit with new fee params and replay token.
+    Resubmit {
+        fee: A::FeeParams,
+        replay_token: A::ReplayToken,
+    },
+    /// Re-queue the message for a fresh attempt later.
+    Requeue,
+    /// Abandon the message.
+    Abandon,
+}
+```
 
-- **Ethereum path** (unchanged): resubmit at the same nonce with a bumped fee.
-- **Solana path**: call `next()` for a fresh blockhash, rebuild and re-sign the
-  transaction with a bumped compute unit price, and submit as a new
-  transaction.
+This moves all retry logic out of `Sender` and into the adapter. The Ethereum
+strategy resubmits at the same nonce with bumped fees; the Solana strategy
+acquires a fresh blockhash and bumps the compute unit price. Both strategies
+share the same budgeting counters (`replacement_count`, `retry_count`).
 
-The `PendingTransaction` struct gains a `SequenceToken` field in place of the
-`nonce: u64` field, and the replacement logic branches accordingly.
+This also future-proofs the design: if an alternative Ethereum nonce strategy
+(e.g., the proposed 256-parallel-nonce scheme) gains traction, it can be
+implemented as a second Ethereum adapter without modifying `Sender` or the
+existing Ethereum adapter.
 
-The implementation has two independent retry budgets that both chains respect:
-`MAX_REPLACEMENTS` (per `PendingTransaction`) caps how many times a single
-transaction's fee is bumped before the message is re-queued; `MAX_RETRIES` (per
-`Message`) caps how many times the message itself is retried end-to-end. On
-Solana each fee bump creates a new transaction (fresh blockhash + higher compute
-unit price) and increments `replacement_count`. When `MAX_REPLACEMENTS` is
-exhausted, the message increments `retry_count` and re-enters the queue. Both
-counters apply to both chains.
+### 4.5 Sender Changes
 
-### 4.5 Message Changes
+`Sender` becomes generic over the adapter:
 
-The `Message` struct remains chain-agnostic. However, the chain-specific data
-it carries must be flexible:
+```rust
+pub struct Sender<A: ChainAdapter> {
+    client: Arc<A::Client>,
+    fees: Arc<A::FeeManager>,
+    replay: Arc<A::ReplayProtection>,
+    retry: Arc<A::RetryStrategy>,
+
+    queue: SharedQueue,
+    pending: SharedPendingMap<A>,
+    max_in_flight: Arc<Semaphore>,
+    message_ready: Arc<Notify>,
+}
+```
+
+The core `run()` loop, `add_message()`, `process_next_message()`, and
+semaphore management are identical across chains. Chain-specific behavior is
+fully delegated to the adapter's component implementations:
+
+- **Transaction building and sending** → `A::Client::send_transaction()`
+- **Fee computation** → `A::FeeManager::get_fee_params()`
+- **Replay protection** → `A::ReplayProtection::next()`
+- **Retry/drop handling** → `A::RetryStrategy::handle_dropped()`
+- **Confirmation feedback** → `A::RetryStrategy::handle_confirmed()`
+
+### 4.6 Message Changes
+
+During Phase 1, the `Message` struct gains a `payload` field alongside the
+existing `to`, `value`, `data`, and `gas` fields for backward compatibility:
+
+```rust
+pub struct Message {
+    // Existing fields (preserved during Phase 1 for backward compatibility)
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Bytes,
+    pub gas: u64,
+
+    // Shared fields
+    pub priority: u32,
+    pub deadline: Option<DateTime<Utc>>,
+    created_at: Instant,
+    retry_count: u32,
+
+    // Chain-specific payload (added in Phase 1)
+    pub payload: Option<TransactionPayload>,
+}
+```
+
+Internal code paths prefer `payload` when it is `Some`, falling back to the
+existing fields otherwise. The old fields are marked `#[deprecated]` and
+removed in a subsequent 0.2.x release, at which point `payload` becomes
+required (non-`Option`).
+
+The final target struct (post-0.2.x) is:
 
 ```rust
 pub struct Message {
@@ -397,7 +534,11 @@ pub struct Message {
     retry_count: u32,
     pub payload: TransactionPayload,
 }
+```
 
+`TransactionPayload` variants are feature-gated:
+
+```rust
 pub enum TransactionPayload {
     #[cfg(feature = "ethereum")]
     Ethereum {
@@ -409,7 +550,6 @@ pub enum TransactionPayload {
     #[cfg(feature = "solana")]
     Solana {
         instructions: Vec<solana_sdk::instruction::Instruction>,
-        /// Compute unit limit for this transaction (default: 200,000).
         compute_units: u32,
     },
 }
@@ -419,7 +559,7 @@ The `effective_priority` calculation is unchanged — it depends only on
 `priority`, `retry_count`, `created_at`, and `deadline`, none of which are
 chain-specific.
 
-### 4.6 Solana ChainClient Implementation
+### 4.7 Solana ChainClient Implementation
 
 ```rust
 pub struct SolanaChain {
@@ -432,35 +572,37 @@ pub struct SolanaChain {
 
 **Dependencies** (feature-gated under `solana`):
 
-| Crate | Purpose |
-|-------|---------|
-| `solana-sdk` | `Keypair`, `VersionedTransaction`, `Instruction`, `Hash`, `Signature` |
-| `solana-client` | `RpcClient` (HTTP/HTTPS), `PubsubClient` (WebSocket) |
-| `solana-transaction-status` | Transaction status types |
+| Crate | Purpose | Feature flags |
+|-------|---------|---------------|
+| `solana-sdk` | `Keypair`, `VersionedTransaction`, `Instruction`, `Hash`, `Signature` | `default-features = false` — disable unused features aggressively |
+| `solana-client` | `RpcClient` (HTTP/HTTPS), `PubsubClient` (WebSocket) | `default-features = false` |
+| `solana-transaction-status` | Transaction status types | `default-features = false` |
+
+All Solana crates are added with `default-features = false` and only the
+specific features needed are enabled, to minimize the transitive dependency
+footprint.
 
 **Key methods:**
 
 - `subscribe_new_blocks`: Uses `PubsubClient::slot_subscribe` to receive slot
   notifications, bridged into an mpsc channel (same pattern as the Ethereum
   implementation).
-- `send_transaction`: Receives a `TransactionPayload`, `FeeParams`, and
-  `SequenceToken`; builds a `VersionedTransaction` from the message's
-  instructions (prepending `ComputeBudgetProgram` instructions for priority fee
-  and compute unit limit), signs with the stored `Keypair`, and sends via
-  `RpcClient::send_transaction` with `skip_preflight: true` (preflight is done
-  separately in simulation). `VersionedTransaction` is used in preference to the
-  legacy `Transaction` type because it supports Address Lookup Tables, which are
-  required when approaching the 1,232-byte packet limit.
-- `get_transaction_status`: Uses `RpcClient::get_signature_statuses` to poll
-  for confirmation at the configured commitment level.
+- `send_transaction`: Receives a `TransactionPayload`, `FeeParams`, and a
+  blockhash; builds a `VersionedTransaction` from the message's instructions
+  (prepending `ComputeBudgetProgram` instructions for priority fee and compute
+  unit limit), signs with the stored `Keypair`, and sends via
+  `RpcClient::send_transaction` with `skip_preflight: true`.
+  `VersionedTransaction` is used in preference to the legacy `Transaction` type
+  because it supports Address Lookup Tables, which are required when
+  approaching the 1,232-byte packet limit.
+- `get_transaction_status`: Uses `RpcClient::get_signature_statuses` to check
+  confirmation at the configured commitment level.
 
-### 4.7 Solana FeeManager Implementation
+### 4.8 Solana FeeManager Implementation
 
 ```rust
 pub struct SolanaFeeManager {
-    /// Rolling window of confirmation times (same pattern as GasPriceManager).
     confirmation_times: Mutex<VecDeque<Duration>>,
-    /// Current compute unit price estimate (micro-lamports).
     compute_unit_price: Mutex<u64>,
 }
 ```
@@ -469,7 +611,8 @@ pub struct SolanaFeeManager {
 
 1. Periodically call `getRecentPrioritizationFees` (targeting the accounts the
    messages will touch).
-2. Compute the 50/50 moving average of recent fees (same algorithm as `GasPriceManager`).
+2. Compute the 50/50 moving average of recent fees (same algorithm as
+   `GasPriceManager`).
 3. Apply the same congestion-level multiplier pattern (Low/Medium/High based on
    confirmation times).
 4. Apply the message priority multiplier (100%–200%).
@@ -478,43 +621,118 @@ pub struct SolanaFeeManager {
 This mirrors the `GasPriceManager` design exactly, just with different units
 (micro-lamports per compute unit instead of wei per gas).
 
-### 4.8 Solana SequenceManager Implementation
+### 4.9 Solana ReplayProtection Implementation
 
 ```rust
-pub struct SolanaBlockhashManager {
-    rpc_client: Arc<RpcClient>,
-    /// Cached recent blockhash and the block height at which it expires.
+pub struct SolReplayProtection {
     state: Mutex<BlockhashState>,
 }
 
 struct BlockhashState {
-    /// Raw 32-byte blockhash.
     blockhash: [u8; 32],
-    /// Block height past which the blockhash is invalid, as returned by
-    /// `getLatestBlockhash` → `lastValidBlockHeight`. Block height (not slot
-    /// number) is the authoritative expiry measure.
     last_valid_block_height: u64,
+    /// The slot number at which this blockhash was fetched, used to
+    /// determine age for refresh decisions.
+    fetched_at_slot: u64,
 }
 ```
 
 **Behavior:**
 
-- `next()` checks whether `last_valid_block_height - current_block_height` is
-  above a safety threshold (e.g., 20 blocks). If not, it fetches a fresh
-  blockhash first. Current block height is obtained via `get_block_number()`.
-  Returns `Result<SequenceToken::Blockhash([u8; 32]), Error>` so that RPC
-  failures are properly propagated to the caller. Wall-clock time is never used
-  for this determination — the chain's own block height is the only reliable
-  source of truth.
-- `release()` is a no-op (blockhashes are not exclusive).
-- `confirm()` is a no-op (no nonce to advance).
-- `sync()` is called on each slot notification; it calls `get_block_number()`
-  and proactively refreshes the cached blockhash if it is within the safety
-  threshold of expiry.
+- `next()` is synchronous — returns the cached blockhash from in-memory state.
+  No RPC call is made. This ensures transaction crafting never blocks on I/O.
+- `sync()` is called on each slot notification. It compares the current block
+  height to `last_valid_block_height`. If the remaining validity is less than
+  half the window (~75 blocks out of ~150), it proactively refreshes the
+  cached blockhash via `getLatestBlockhash`. The half-window threshold is
+  measured from the slot time of the last-fetched blockhash, not from
+  wall-clock time.
 
-Unlike Ethereum's `NonceManager`, there is no contention — multiple concurrent
-transactions can share the same recent blockhash without conflict. This
-simplifies the design considerably.
+Multiple concurrent transactions share the same blockhash without conflict.
+
+### 4.10 Solana Confirmation Watching
+
+Solana does not have Ethereum's `PendingTransactionBuilder` watcher.
+Confirmation is driven by **slot subscription notifications**, not by
+polling with sleep intervals:
+
+```rust
+async fn watch_transaction(
+    &self,
+    id: &SolTxId,
+    slot_receiver: &mut SlotReceiver,
+) -> Result<TransactionStatus, Error> {
+    loop {
+        // Wait for the next slot notification — no sleep, no polling.
+        match slot_receiver.recv().await {
+            Some(slot_info) => {
+                let statuses = self.rpc_client
+                    .get_signature_statuses(&[signature])
+                    .await?;
+                if let Some(Some(status)) = statuses.value.first() {
+                    if status.err.is_some() {
+                        return Ok(TransactionStatus::Failed {
+                            reason: format!("{:?}", status.err),
+                        });
+                    }
+                    if status.satisfies_commitment(self.commitment) {
+                        return Ok(TransactionStatus::Confirmed {
+                            number: status.slot,
+                        });
+                    }
+                }
+                // Check if the blockhash has expired by block height.
+                let block_height = self.rpc_client
+                    .get_block_height().await?;
+                if block_height > last_valid_block_height {
+                    return Ok(TransactionStatus::Expired);
+                }
+            }
+            None => {
+                return Err(Error::SubscriptionClosed);
+            }
+        }
+    }
+}
+```
+
+This approach:
+- **Never sleeps** — confirmation checks are driven by slot subscription
+  events, eliminating non-deterministic alignment issues.
+- **Checks on every slot** — more responsive than sleeping for a fixed
+  interval.
+- **Uses block height for expiry** — not wall-clock time. The chain's own
+  block height is the only reliable source of truth for blockhash validity.
+
+### 4.11 Transaction Timeout
+
+On Ethereum, `TX_TIMEOUT = 3s` is used. On Solana, transactions are naturally
+bounded by blockhash expiry (~150 blocks / ~60 seconds). The Solana timeout is
+driven by **block height**, not wall-clock time — the chain's own progression
+determines when a transaction is too old, which is more reliable than any
+local timer.
+
+The `RetryStrategy` implementation uses the `last_valid_block_height` from the
+blockhash to determine when a transaction has expired. This is inherently
+chain-accurate, unlike clock-based timeouts that can drift.
+
+### 4.12 Retry Strategy Divergence
+
+| Scenario | Ethereum | Solana |
+|----------|----------|--------|
+| Transaction stuck | Replace at same nonce with +20% fee | Resubmit with new blockhash + higher CU price |
+| Transaction dropped | Detected via timeout, replace | Detected via block-height expiry; resubmit |
+| Max replacements | Re-queue message | Re-queue message |
+| Max retries | Abandon message | Abandon message |
+| Fee bumping | `new_fee = fee + fee * 20%` | `new_cu_price = cu_price + cu_price * 20%` |
+
+Both strategies share the two-tier budget: `MAX_REPLACEMENTS` caps per-
+transaction fee bumps; `MAX_RETRIES` caps per-message retries end-to-end.
+
+When a Solana transaction is retried, the old transaction may still confirm
+(it's valid until its blockhash expires). The retry strategy tracks all
+outstanding transaction IDs per message and considers the message confirmed if
+**any** of them lands, ignoring subsequent confirmations.
 
 ---
 
@@ -525,8 +743,8 @@ simplifies the design considerably.
 ```toml
 [features]
 default = ["ethereum"]
-ethereum = ["alloy", "secp256k1", "ethereum-types"]
-solana = ["solana-sdk", "solana-client", "solana-transaction-status"]
+ethereum = ["dep:alloy", "dep:secp256k1", "dep:ethereum-types"]
+solana = ["dep:solana-sdk", "dep:solana-client", "dep:solana-transaction-status"]
 
 [dependencies]
 # Shared
@@ -535,146 +753,51 @@ async-trait = "0.1"
 chrono = "0.4"
 log = "0.4"
 thiserror = "2.0"
-# ... other shared deps
 
 # Ethereum (feature-gated)
-alloy = { version = "1.7", optional = true, ... }
+alloy = { version = "1.7", optional = true, default-features = false, features = [
+    "std", "provider-ws", "pubsub", "rpc-types", "signer-local", "k256"
+] }
 secp256k1 = { version = "0.31", optional = true }
 ethereum-types = { version = "0.16", optional = true }
 
-# Solana (feature-gated)
-solana-sdk = { version = "2.2", optional = true }
-solana-client = { version = "2.2", optional = true }
-solana-transaction-status = { version = "2.2", optional = true }
+# Solana (feature-gated, aggressively trimmed)
+solana-sdk = { version = "2.2", optional = true, default-features = false }
+solana-client = { version = "2.2", optional = true, default-features = false }
+solana-transaction-status = { version = "2.2", optional = true, default-features = false }
 ```
-
-This ensures that a project using Bulkmail for Ethereum-only does not pull in
-the Solana SDK (which is substantial), and vice versa.
 
 ### 5.2 Conditional Compilation
-
-Chain-specific modules use `#[cfg(feature = "ethereum")]` and
-`#[cfg(feature = "solana")]` gates. The core modules (`message.rs`,
-`priority_queue.rs`, `sender.rs`) are always compiled but use the trait
-abstractions.
-
-The `TransactionPayload` and `FeeParams` enums' variants are also
-feature-gated:
-
-```rust
-pub enum TransactionPayload {
-    #[cfg(feature = "ethereum")]
-    Ethereum { ... },
-    #[cfg(feature = "solana")]
-    Solana { ... },
-}
-```
-
-**Note:** At least one of the `ethereum` or `solana` features must be enabled;
-otherwise `TransactionPayload` and `FeeParams` would have no variants, causing
-a compilation error. (`SequenceToken` uses only primitive types and is always
-fully defined.) The `default = ["ethereum"]` feature ensures this for the
-common case. When both features are enabled simultaneously, all variants are
-present and the `Sender` can be instantiated with either chain's
-implementations. A compile-time assertion emits a clear error if neither
-feature is enabled:
 
 ```rust
 #[cfg(not(any(feature = "ethereum", feature = "solana")))]
 compile_error!("At least one chain feature (\"ethereum\" or \"solana\") must be enabled.");
 ```
 
+Chain-specific adapter modules use `#[cfg(feature = "...")]` gates. The core
+modules (`message.rs`, `priority_queue.rs`, `sender.rs`) are always compiled.
+
 ---
 
 ## 6. Solana-Specific Considerations
 
-### 6.1 Transaction Confirmation Polling
+### 6.1 Preflight Simulation
 
-Solana does not have Ethereum's `PendingTransactionBuilder` watcher. Instead,
-confirmation must be polled:
+Both Ethereum and Solana support transaction simulation, but neither chain has
+simulation logic implemented in Bulkmail today. The `SimulationFailed` variant
+in the `Error` enum is a placeholder — it is never constructed anywhere in the
+codebase. Full simulation wiring (`simulateTransaction` call, error
+extraction, integration into the send path) would need to be written from
+scratch for either chain. This is out of scope for the initial Solana
+implementation.
 
-```rust
-async fn watch_transaction(
-    &self,
-    id: TransactionId,
-    timeout: Duration,
-) -> Result<TransactionStatus, Error> {
-    let signature = Signature::from(id.0);
-    match tokio::time::timeout(timeout, async {
-        let mut interval = tokio::time::interval(Duration::from_millis(400));
-        loop {
-            interval.tick().await;
-            let statuses = self.rpc_client
-                .get_signature_statuses(&[signature])
-                .await?;
-            if let Some(Some(status)) = statuses.value.first() {
-                if status.err.is_some() {
-                    return Ok(TransactionStatus::Failed {
-                        reason: format!("{:?}", status.err),
-                    });
-                }
-                if status.satisfies_commitment(self.commitment) {
-                    return Ok(TransactionStatus::Confirmed {
-                        slot_or_block: status.slot,
-                    });
-                }
-            }
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_elapsed) => Ok(TransactionStatus::Expired),
-    }
-}
-```
-
-The 400ms polling interval matches Solana's ~400ms slot time. The outer
-`tokio::time::timeout` wrapper cleanly separates the timeout concern from the
-polling loop — no manual deadline arithmetic or sleep-then-check ordering.
-
-### 6.2 Transaction Timeout
-
-On Ethereum, `TX_TIMEOUT = 3s` is used. On Solana, transactions are naturally
-bounded by blockhash expiry (~60 seconds). However, we want faster feedback.
-A reasonable Solana timeout is **15–30 seconds** — if a transaction hasn't
-confirmed by then, it's likely not going to be picked up by the current leader
-and should be retried with a fresh blockhash.
-
-This timeout should be chain-configurable rather than a compile-time constant.
-
-### 6.3 Retry Without Replacement
-
-Since Solana has no nonce-based replacement, retries on Solana create entirely
-new transactions:
-
-1. Fetch fresh blockhash.
-2. Rebuild transaction with bumped compute unit price.
-3. Re-sign with keypair.
-4. Submit as a new, independent transaction.
-
-The old transaction may still confirm (it's valid until its blockhash expires).
-To handle this, the `Sender` should track both the old and new transaction
-signatures and consider the message confirmed if **either** lands. This is a
-minor addition to the pending map — instead of a single `TxHash`, the Solana
-path maintains a `Vec<Signature>` per message.
-
-### 6.4 Preflight Simulation
-
-Solana supports transaction simulation via `simulateTransaction`. This should
-be used before sending to catch errors early (insufficient balance, program
-errors, compute budget exceeded). The `SimulationFailed` variant in the `Error`
-enum is currently a placeholder with no simulation logic behind it; the full
-wiring (`simulateTransaction` call, error extraction, integration into the send
-path) will need to be implemented as part of Phase 2.
-
-### 6.5 Concurrency
+### 6.2 Concurrency
 
 Solana's parallel execution model means the semaphore cap can potentially be
 higher than Ethereum's 16. Since there are no nonce-ordering constraints,
-Solana can sustain more concurrent in-flight transactions. Consider making
-`MAX_IN_FLIGHT_TRANSACTIONS` a configurable parameter with a higher default
-for Solana (e.g., 64).
+Solana can sustain more concurrent in-flight transactions.
+`MAX_IN_FLIGHT_TRANSACTIONS` should be a configurable parameter with a higher
+default for Solana (e.g., 64).
 
 ---
 
@@ -682,59 +805,102 @@ for Solana (e.g., 64).
 
 | Bulkmail Concept | Ethereum Implementation | Solana Implementation |
 |------------------|------------------------|----------------------|
+| **Adapter Tag** | `adapters::Eth` | `adapters::Sol` |
 | **Chain Client** | Alloy WebSocket, EthereumWallet, secp256k1 | `RpcClient` + `PubsubClient`, `Keypair`, Ed25519 |
 | **Block Subscription** | `eth_subscribe("newHeads")` via Alloy | `slotSubscribe` via `PubsubClient` |
-| **Sequencing** | `NonceManager` (monotonic nonce tracking) | `BlockhashManager` (recent blockhash caching) |
-| **Fee Management** | `GasPriceManager` (EIP-1559 base + priority fee) | `SolanaFeeManager` (compute unit price) |
-| **Fee Data Source** | Confirmation time 50/50 moving average | `getRecentPrioritizationFees` + confirmation time 50/50 moving average |
-| **Transaction Building** | `TxEip1559` struct | `solana_sdk::transaction::VersionedTransaction` with `ComputeBudget` instructions |
+| **Replay Protection** | `EthReplayProtection` (nonce pool) | `SolReplayProtection` (blockhash cache) |
+| **Fee Management** | `EthFeeManager` (EIP-1559 base + priority fee) | `SolFeeManager` (compute unit price) |
+| **Retry Strategy** | `EthRetryStrategy` (same nonce, bumped fee) | `SolRetryStrategy` (new blockhash, bumped CU price) |
+| **Transaction Building** | `TxEip1559` struct | `VersionedTransaction` with `ComputeBudget` instructions |
 | **Signing** | `EthereumWallet` (secp256k1) | `Keypair::sign_message` (Ed25519) |
-| **Confirmation** | Alloy's `PendingTransactionBuilder` with timeout | Polling `get_signature_statuses` with commitment level |
-| **Stuck Tx Handling** | Same nonce, bumped fee (replacement) | Fresh blockhash, bumped CU price (new transaction) |
-| **Timeout** | 3 seconds (fast EVM chain) | 15–30 seconds (configurable) |
-| **Max Concurrency** | 16 | 64 (configurable; no ordering constraint) |
-| **Simulation** | Not yet implemented | `simulateTransaction` before send |
+| **Confirmation** | `PendingTransactionBuilder` with timeout | Slot-subscription-driven `get_signature_statuses` |
+| **Timeout** | 3 seconds (fast EVM chain) | Block-height-driven (chain-accurate) |
+| **Max Concurrency** | 16 | 64 (configurable) |
+| **Simulation** | Not implemented | Not implemented (Phase 2+) |
 
 ---
 
 ## 8. Implementation Plan
 
-### Phase 1: Trait Extraction
+### Phase 1: Trait Extraction and Adapter Pattern
 
-**Goal:** Extract the current Ethereum-specific code behind the new traits.
+**Goal:** Introduce the `ChainAdapter` trait and refactor the Ethereum code
+behind it without breaking existing tests.
 
-1. Define `FeeManager`, `SequenceManager` traits and the `FeeParams`,
-   `SequenceToken` types.
-2. Implement `FeeManager` for the existing `GasPriceManager`.
-3. Implement `SequenceManager` for the existing `NonceManager`.
-4. Refactor `Sender` to depend on `Arc<dyn FeeManager>` and
-   `Arc<dyn SequenceManager>` instead of the concrete types.
-5. Generalize the `ChainClient` trait to the chain-agnostic interface described
-   in section 4.3.1.
-6. Replace `Message`'s chain-specific fields (`to`, `value`, `data`, `gas`)
-   with `payload: TransactionPayload`.
+**Concrete steps:**
 
-**Estimated effort:** 2–3 days.
+1. **Create `src/adapter/mod.rs`**: Define `ChainAdapter`, `ChainClient<A>`,
+   `FeeManager<A>`, `ReplayProtection<A>`, `RetryStrategy<A>` traits and
+   `RetryDecision<A>` type. Also define `TransactionStatus` at the crate
+   root level (not as an adapter associated type) — it is chain-agnostic
+   and uses only primitive types.
+
+2. **Create `src/adapter/ethereum.rs`**: Define the `Eth` tag type and
+   implement all associated types:
+   - `impl ChainAdapter for Eth` — binds `Payload`, `FeeParams`,
+     `ReplayToken`, `TxId`, and all component types.
+   - `EthClient` — wraps the existing `Chain` struct, implementing
+     `ChainClient<Eth>`.
+   - `EthFeeManager` — wraps the existing `GasPriceManager`, implementing
+     `FeeManager<Eth>`.
+   - `EthReplayProtection` — wraps the existing `NonceManager`, implementing
+     `ReplayProtection<Eth>` with a synchronous `next()` and an
+     Ethereum-only `release_nonce()` / `confirm_nonce()`.
+   - `EthRetryStrategy` — extracts the current `handle_transaction_dropped`
+     and `bump_transaction_fee` logic from `sender.rs`, implementing
+     `RetryStrategy<Eth>`.
+
+3. **Refactor `src/sender.rs`**: Make `Sender` generic over `A: ChainAdapter`.
+   Replace direct calls to `NonceManager`, `GasPriceManager`, and `Chain`
+   with calls through the adapter's component traits. The `run()` loop
+   structure, `add_message()`, `process_next_message()`, and semaphore
+   management remain unchanged.
+
+4. **Update `src/message.rs`**: Add `payload: Option<TransactionPayload>`
+   alongside existing fields. Internal code paths prefer `payload` when
+   `Some`. Mark old fields `#[deprecated]`.
+
+5. **Update `src/lib.rs`**: Add `pub mod adapter;`, re-export adapter types,
+   add feature-gate `compile_error!`.
+
+6. **Move `src/bin/oracle.rs` → `examples/oracle_eth.rs`**: Update
+   `Cargo.toml` to use `[[example]]` instead of `[[bin]]`.
+
+7. **All existing tests pass** without modification (the Ethereum adapter
+   is a direct wrapper around existing code).
+
+**Estimated effort:** 3–4 days.
 
 ### Phase 2: Solana Implementation
 
-**Goal:** Implement Solana-specific modules behind the `solana` feature flag.
+**Goal:** Implement Solana-specific adapter behind the `solana` feature flag.
 
-1. Add `solana-sdk`, `solana-client` dependencies (feature-gated).
-2. Implement `SolanaChain` (`ChainClient` for Solana).
-3. Implement `SolanaFeeManager` (`FeeManager` for Solana).
-4. Implement `SolanaBlockhashManager` (`SequenceManager` for Solana).
-5. Implement Solana-specific retry logic in `Sender` (fresh blockhash +
-   bumped CU price; multi-signature pending tracking).
-6. Add unit tests with mock RPC responses.
+1. **Add Solana dependencies** to `Cargo.toml` (feature-gated, with
+   `default-features = false`).
+
+2. **Create `src/adapter/solana.rs`**: Define the `Sol` tag type and
+   implement all associated types:
+   - `SolClient` implementing `ChainClient<Sol>` — wraps `RpcClient` and
+     `PubsubClient`.
+   - `SolFeeManager` implementing `FeeManager<Sol>` — uses
+     `getRecentPrioritizationFees`.
+   - `SolReplayProtection` implementing `ReplayProtection<Sol>` — maintains
+     blockhash cache, synchronous `next()`, block-height-driven `sync()`.
+   - `SolRetryStrategy` implementing `RetryStrategy<Sol>` — fresh blockhash +
+     bumped CU price; tracks multiple tx IDs per message.
+
+3. **Add Solana-specific confirmation watching** driven by slot subscriptions.
+
+4. **Unit tests** with mock RPC responses (same pattern as existing
+   `MockChainClient` tests).
 
 **Estimated effort:** 4–5 days.
 
-### Phase 3: Oracle Simulation & Integration Testing
+### Phase 3: Examples & Integration Testing
 
-**Goal:** Validate end-to-end with a local Solana test validator.
+**Goal:** Validate end-to-end with local test infrastructure.
 
-1. Create `oracle_solana.rs` using `solana-test-validator`.
+1. **Create `examples/oracle_sol.rs`** using `solana-test-validator`.
 2. Test concurrent SOL transfers (analogous to the Anvil oracle).
 3. Test retry and fee-bumping scenarios.
 4. Test blockhash expiry handling.
@@ -744,10 +910,9 @@ for Solana (e.g., 64).
 
 ### Phase 4: Documentation & Polish
 
-1. Update `ARCHITECTURE.md` with multi-chain design.
-2. Update `README.md` with Solana usage examples.
-3. Add `docs/solana.md` with Solana-specific details.
-4. Add `CHANGELOG.md` entry.
+1. Update `README.md` with multi-chain usage examples.
+2. Add `docs/solana.md` with Solana-specific operational details.
+3. Add `CHANGELOG.md` entry.
 
 **Estimated effort:** 1 day.
 
@@ -757,12 +922,13 @@ for Solana (e.g., 64).
 
 | Risk | Mitigation |
 |------|-----------|
-| **Solana SDK crate size** — `solana-sdk` pulls in many transitive dependencies | Feature gating ensures Ethereum-only users are unaffected |
-| **Blockhash expiry race** — Transaction built with a near-expiry blockhash | `BlockhashManager` enforces a ~15-second safety margin; retries use fresh blockhashes |
-| **Duplicate confirmations** — Both old and retried Solana transactions confirm | Track all signatures per message; accept first confirmation, ignore subsequent ones |
-| **Account contention** — Many transactions writing to the same account are serialized | Configurable concurrency cap; callers should batch instructions per-account |
-| **RPC rate limits** — High polling frequency for confirmations | Exponential backoff; configurable polling interval; batch `get_signature_statuses` calls |
-| **API stability** — Solana SDK versions change frequently | Pin to a stable 2.x release; abstract behind trait so SDK upgrades are localized |
+| **Solana SDK crate size** | Feature gating + `default-features = false` on all Solana crates |
+| **Blockhash expiry race** | Half-window refresh threshold (~75 blocks); retries use fresh blockhashes |
+| **Duplicate confirmations** | Track all tx IDs per message; accept first, ignore subsequent |
+| **Account contention** | Configurable concurrency cap; callers batch instructions per-account |
+| **RPC rate limits** | Exponential backoff; batch `get_signature_statuses`; slot-driven not timer-driven |
+| **API stability** | Pin to stable 2.x release; abstract behind trait so SDK upgrades are localized |
+| **Enum overhead** | Initial enum-based dispatch is temporary; adapter pattern is designed for direct monomorphization via GATs |
 
 ---
 
@@ -778,32 +944,58 @@ The following components are fully chain-agnostic and require zero changes:
 | `Sender::run` loop structure | `select!` on block notifications + message processing |
 | `Sender::add_message` | Enqueue + notify |
 | Deadline system | Wall-clock based, chain-independent |
-| Retry counting (`MAX_RETRIES` + `MAX_REPLACEMENTS`) | Two independent budgets: `MAX_REPLACEMENTS` caps per-transaction fee bumps; `MAX_RETRIES` caps per-message retries end-to-end |
+| Retry budgets (`MAX_RETRIES` + `MAX_REPLACEMENTS`) | Chain-independent; strategies implement the budgeting logic |
 | Error types (most) | `MessageExpired`, `RetriesExceeded`, etc. are generic |
 
-This represents roughly **60% of the codebase** remaining identical, which
-validates the claim that the current architecture is well-suited for
-multi-chain extension.
+This represents roughly **60% of the codebase** remaining identical.
 
 ---
 
-## 11. Conclusion
+## 11. Migration Path: Enums → Generic Associated Types
+
+The initial implementation uses enums (`TransactionPayload`, potentially
+`FeeParams`) for expedience. The adapter trait is designed to enable a clean
+migration to fully monomorphized generics:
+
+1. **Phase 1:** `Sender<A: ChainAdapter>` is generic. Associated types
+   (`A::Payload`, `A::FeeParams`, `A::ReplayToken`, `A::TxId`) are concrete
+   types specific to each adapter. Internally, some code may still use enum
+   dispatch where convenient.
+
+2. **Phase 2 (post-Solana):** Replace any remaining enum dispatch with direct
+   associated type usage. Remove `Arc<dyn ...>` in favor of concrete types
+   where possible. This eliminates the current `Arc<dyn ChainClient>` pattern
+   that incurs virtual dispatch overhead.
+
+3. **Final state:** `Sender<adapters::Eth>` and `Sender<adapters::Sol>` are
+   fully monomorphized. Each chain's `FeeParams`, `ReplayToken`, and `TxId`
+   are their natural sizes with no enum padding overhead (e.g., Solana's
+   `FeeParams` is exactly 12 bytes, not padded to match Ethereum's 32 bytes).
+
+---
+
+## 12. Conclusion
 
 Bulkmail's existing architecture — trait-based chain abstraction, late-bound
 transaction parameters, separation of message intent from execution details —
 provides an excellent foundation for Solana support. The key insight is that
-while Ethereum and Solana differ fundamentally in sequencing (nonces vs.
+while Ethereum and Solana differ fundamentally in replay protection (nonces vs.
 blockhashes), fee structure (EIP-1559 vs. compute units), and retry strategy
 (replacement vs. resubmission), these differences can be cleanly encapsulated
-behind three traits (`ChainClient`, `FeeManager`, `SequenceManager`) while
-sharing the orchestration, priority, concurrency, and retry-budget logic.
+behind a single `ChainAdapter` trait with associated types, while sharing the
+orchestration, priority, concurrency, and retry-budget logic.
+
+The adapter pattern — with tag types (`adapters::Eth`, `adapters::Sol`)
+binding all chain-specific components at the type level — ensures type safety,
+eliminates the possibility of mismatched components, and provides a clear path
+from initial enum-based dispatch to fully monomorphized generics.
 
 The recommended Rust crates for the Solana implementation are:
 
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| `solana-sdk` | 2.2.x | Key management (Ed25519 `Keypair`), transaction construction, `Instruction`, `Hash`, `Signature` |
-| `solana-client` | 2.2.x | `RpcClient` for JSON-RPC, `PubsubClient` for WebSocket slot subscriptions |
-| `solana-transaction-status` | 2.2.x | Transaction status types and commitment level handling |
+| Crate | Version | Purpose | Features |
+|-------|---------|---------|----------|
+| `solana-sdk` | 2.2.x | Key management, tx construction, `Instruction`, `Hash`, `Signature` | `default-features = false` |
+| `solana-client` | 2.2.x | `RpcClient` for JSON-RPC, `PubsubClient` for WebSocket | `default-features = false` |
+| `solana-transaction-status` | 2.2.x | Transaction status types and commitment levels | `default-features = false` |
 
-The estimated total effort is **9–12 days** across four phases.
+The estimated total effort is **10–13 days** across four phases.
