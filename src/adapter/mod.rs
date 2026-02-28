@@ -61,16 +61,31 @@ pub trait ChainClient<A: ChainAdapter>: Send + Sync {
     /// Get the current block number (ETH) or confirmed block height (SOL).
     async fn get_block_number(&self) -> Result<u64, Error>;
 
-    /// Build, sign, and submit a transaction from the message's fields.
+    /// Build, sign, submit, and watch a transaction to completion.
+    ///
+    /// Returns a [`SendOutcome`] indicating whether the transaction confirmed,
+    /// was dropped/timed out, or failed on-chain. This allows the caller to
+    /// handle each outcome generically without Ethereum-specific error types.
     async fn send_transaction(
         &self,
         msg: &crate::Message,
         fee: &A::FeeParams,
         replay_token: &A::ReplayToken,
-    ) -> Result<A::TxId, Error>;
+    ) -> Result<SendOutcome<A>, Error>;
 
     /// Check the confirmation status of a previously sent transaction.
     async fn get_transaction_status(&self, id: &A::TxId) -> Result<TransactionStatus, Error>;
+}
+
+/// The outcome of a send-and-watch operation.
+#[derive(Debug)]
+pub enum SendOutcome<A: ChainAdapter> {
+    /// Transaction was confirmed on-chain.
+    Confirmed { tx_id: A::TxId },
+    /// Transaction was dropped or timed out without confirming.
+    Dropped { tx_id: A::TxId },
+    /// Transaction was confirmed but reverted on-chain.
+    Reverted { tx_id: A::TxId },
 }
 
 /// Chain-agnostic transaction confirmation status.

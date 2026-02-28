@@ -2,7 +2,7 @@
 
 use crate::adapter::{
     ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
-    RetryStrategy,
+    RetryStrategy, SendOutcome,
 };
 use crate::{Error, Message, PriorityQueue};
 use alloy::transports::RpcError::ErrorResp;
@@ -149,9 +149,6 @@ impl<A: ChainAdapter> Sender<A> {
                             }
                             error!("Error processing message: {:?}", e);
                         }
-                        Error::TransactionDropped(tx_hash) => {
-                            debug!("Transaction {:?} dropped, handling retry", tx_hash);
-                        }
                         _ => {
                             error!("Error processing message: {:?}", e);
                         }
@@ -195,45 +192,49 @@ impl<A: ChainAdapter> Sender<A> {
             return Err(Error::MessageExpired);
         }
 
-        // Send the transaction via the chain client
-        let tx_id = match self
+        let created_at = Instant::now();
+
+        // Send the transaction via the chain client.
+        // Returns a SendOutcome indicating confirmation, drop, or revert.
+        match self
             .client
             .send_transaction(&msg, &fee, &replay_token)
-            .await
+            .await?
         {
-            Ok(id) => id,
-            Err(e) => {
-                // If send failed, handle it as a dropped transaction
-                return Err(e);
+            SendOutcome::Confirmed { tx_id } => {
+                // Transaction confirmed — update trackers
+                let pending = PendingTransaction {
+                    msg,
+                    tx_id,
+                    fee,
+                    replay_token,
+                    created_at,
+                    replacement_count,
+                };
+                let confirmation_time = pending.created_at.elapsed();
+                self.retry
+                    .handle_confirmed(&pending, &self.fees, &self.replay, confirmation_time)
+                    .await;
+                Ok(())
             }
-        };
-
-        // Track the pending transaction
-        let pending = PendingTransaction {
-            msg: msg.clone(),
-            tx_id: tx_id.clone(),
-            fee: fee.clone(),
-            replay_token: replay_token.clone(),
-            created_at: Instant::now(),
-            replacement_count,
-        };
-        self.pending
-            .lock()
-            .await
-            .insert(tx_id.clone(), pending.clone());
-
-        // Transaction confirmed successfully — handle confirmation
-        let confirmation_time = pending.created_at.elapsed();
-        self.retry
-            .handle_confirmed(&pending, &self.fees, &self.replay, confirmation_time)
-            .await;
-        self.pending.lock().await.remove(&tx_id);
-
-        Ok(())
+            SendOutcome::Dropped { tx_id } | SendOutcome::Reverted { tx_id } => {
+                // Transaction was dropped/timed out or reverted — delegate to retry
+                let pending = PendingTransaction {
+                    msg,
+                    tx_id: tx_id.clone(),
+                    fee,
+                    replay_token,
+                    created_at,
+                    replacement_count,
+                };
+                self.pending.lock().await.insert(tx_id.clone(), pending);
+                self.handle_dropped(&tx_id).await;
+                Ok(())
+            }
+        }
     }
 
     /// Handles a dropped/timed-out transaction by delegating to the retry strategy.
-    #[allow(dead_code)]
     async fn handle_dropped(&self, tx_id: &A::TxId) {
         let pending = {
             let mut map = self.pending.lock().await;
@@ -260,15 +261,9 @@ impl<A: ChainAdapter> Sender<A> {
             .handle_dropped(&pending, &self.client, &self.fees, &self.replay)
             .await
         {
-            RetryDecision::Resubmit { fee, replay_token } => {
-                if let Err(e) = self
-                    .send_and_watch(msg, fee, replay_token, pending.replacement_count + 1)
-                    .await
-                {
-                    error!("Retry failed: {:?}", e);
-                }
-            }
-            RetryDecision::Requeue => {
+            RetryDecision::Resubmit { .. } | RetryDecision::Requeue => {
+                // Re-queue the message; it will get fresh fee params and replay
+                // token when it is next popped from the priority queue.
                 self.add_message(msg).await;
             }
             RetryDecision::Abandon => {
