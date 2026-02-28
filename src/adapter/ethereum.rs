@@ -5,21 +5,17 @@
 //!
 //! [`Sender<Eth>`]: crate::Sender
 
-use crate::{
-    Error, GasPriceManager, NonceManager,
-    adapter::{
-        BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
-        RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
-    },
-    chain,
+use crate::adapter::{
+    BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
+    RetryDecision, RetryStrategy, TransactionStatus,
 };
-use alloy::{
-    consensus::TxEip1559,
-    primitives::{Address, B256, TxKind},
-};
+use crate::{chain, Error, GasPriceManager, NonceManager};
+use alloy::consensus::TxEip1559;
+use alloy::primitives::{Address, TxKind, B256};
 use async_trait::async_trait;
 use log::{error, info, warn};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Maximum number of times a stuck transaction may be replaced with a higher fee.
 const MAX_REPLACEMENTS: u32 = 3;
@@ -93,7 +89,7 @@ impl ChainClient<Eth> for EthClient {
         msg: &crate::Message,
         fee: &EthFeeParams,
         nonce: &u64,
-    ) -> Result<SendOutcome<Eth>, Error> {
+    ) -> Result<B256, Error> {
         let tx = TxEip1559 {
             chain_id: self.inner.id(),
             to: msg.to.map_or(TxKind::Create, TxKind::Call),
@@ -121,26 +117,24 @@ impl ChainClient<Eth> for EthClient {
             Ok(_hash) => {
                 // Check receipt for status
                 match self.inner.get_receipt(tx_hash).await {
-                    Ok(Some(receipt)) if receipt.status() => {
-                        Ok(SendOutcome::Confirmed { tx_id: tx_hash })
-                    }
+                    Ok(Some(receipt)) if receipt.status() => Ok(tx_hash),
                     Ok(Some(_receipt)) => {
                         // Transaction reverted
-                        Ok(SendOutcome::Reverted { tx_id: tx_hash })
+                        Err(Error::TransactionReverted(tx_hash))
                     }
                     Ok(None) => {
                         // Timeout / no receipt
-                        Ok(SendOutcome::Dropped { tx_id: tx_hash })
+                        Err(Error::TransactionDropped(tx_hash))
                     }
                     Err(e) => {
                         error!("Error getting receipt for {:?}: {}", tx_hash, e);
-                        Ok(SendOutcome::Dropped { tx_id: tx_hash })
+                        Err(Error::TransactionDropped(tx_hash))
                     }
                 }
             }
             Err(_) => {
                 // Dropped / timed out
-                Ok(SendOutcome::Dropped { tx_id: tx_hash })
+                Err(Error::TransactionDropped(tx_hash))
             }
         }
     }
@@ -231,20 +225,12 @@ impl EthReplayProtection {
         })
     }
 
-    /// Returns a nonce to the available pool.
-    ///
-    /// This is an Ethereum-specific method not required by the
-    /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
-    /// when a transaction fails before broadcast.
+    /// Ethereum-only: return a nonce to the available pool.
     pub async fn release_nonce(&self, nonce: u64) {
         self.inner.mark_nonce_available(nonce).await;
     }
 
-    /// Advances the confirmed nonce baseline.
-    ///
-    /// This is an Ethereum-specific method not required by the
-    /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
-    /// on transaction confirmation.
+    /// Ethereum-only: advance the confirmed nonce baseline.
     pub async fn confirm_nonce(&self, nonce: u64) {
         self.inner.update_current_nonce(nonce).await;
     }
