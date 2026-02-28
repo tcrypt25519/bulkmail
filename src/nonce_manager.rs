@@ -1,10 +1,10 @@
 //! In-flight nonce tracking and per-block synchronization. See [`NonceManager`].
 
 use crate::{chain::ChainClient, Error};
+use alloy::primitives::Address;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use alloy::primitives::Address;
 
 /// Nonce tracking state guarded by a single [`Mutex`].
 ///
@@ -157,8 +157,8 @@ mod tests {
     async fn test_mark_available_allows_reuse() {
         let nm = nonce_manager_at(0).await;
         let n = nm.get_next_available_nonce().await; // assigns 0
-        nm.mark_nonce_available(n).await;            // returns 0 to the pool
-        // next assignment should give 0 again
+        nm.mark_nonce_available(n).await; // returns 0 to the pool
+                                          // next assignment should give 0 again
         assert_eq!(nm.get_next_available_nonce().await, 0);
     }
 
@@ -167,7 +167,7 @@ mod tests {
         let nm = nonce_manager_at(0).await;
         nm.get_next_available_nonce().await; // 0 in-flight
         nm.get_next_available_nonce().await; // 1 in-flight
-        // Confirming nonce 2 should prune both 0 and 1.
+                                             // Confirming nonce 2 should prune both 0 and 1.
         nm.update_current_nonce(2).await;
         let state = nm.state.lock().await;
         assert_eq!(state.current, 2);
@@ -188,7 +188,7 @@ mod tests {
         nm.get_next_available_nonce().await; // 0
         nm.get_next_available_nonce().await; // 1
         nm.get_next_available_nonce().await; // 2
-        // Confirming up to 1 should prune 0 but keep 1 and 2.
+                                             // Confirming up to 1 should prune 0 but keep 1 and 2.
         nm.update_current_nonce(1).await;
         let in_flight = nm.state.lock().await.in_flight.clone();
         assert!(!in_flight.contains(&0), "nonce 0 is below the new baseline");
@@ -209,7 +209,9 @@ mod tests {
             Ok(nonce)
         });
 
-        let nm = NonceManager::new(Arc::new(mock), Address::default()).await.unwrap();
+        let nm = NonceManager::new(Arc::new(mock), Address::default())
+            .await
+            .unwrap();
         assert_eq!(nm.state.lock().await.current, 0);
         nm.sync_nonce().await.unwrap();
         assert_eq!(nm.state.lock().await.current, 5);

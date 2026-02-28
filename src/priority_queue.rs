@@ -91,9 +91,9 @@ impl Default for PriorityQueue {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
     use super::*;
     use crate::{Error, Message};
+    use alloy::primitives::Address;
 
     #[test]
     fn test_priority_queue() -> Result<(), Error> {

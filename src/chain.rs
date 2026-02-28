@@ -1,16 +1,18 @@
 //! Alloy WebSocket wrapper for Ethereum interaction. See [`Chain`] and [`ChainClient`].
 
-use alloy::primitives::{Address, BlockNumber, B256};
-use alloy::rpc::types::{Header, TransactionReceipt};
-use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect};
 use alloy::consensus::{TxEip1559, TypedTransaction};
 use alloy::network::{Ethereum, EthereumWallet, NetworkWallet};
+use alloy::primitives::{Address, BlockNumber, B256};
+use alloy::providers::{
+    DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect,
+};
+use alloy::rpc::types::{Header, TransactionReceipt};
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 /// An error originating from [`Chain`] operations.
 #[derive(Error, Debug)]
@@ -122,11 +124,15 @@ impl Chain {
     }
 
     /// Signs `tx` and broadcasts it, returning a watcher for confirmation.
-    pub async fn send_transaction(&self, tx: TxEip1559) -> Result<PendingTransactionBuilder<Ethereum>, Error> {
+    pub async fn send_transaction(
+        &self,
+        tx: TxEip1559,
+    ) -> Result<PendingTransactionBuilder<Ethereum>, Error> {
         let envelope = <EthereumWallet as NetworkWallet<Ethereum>>::sign_transaction(
             &self.wallet,
-            TypedTransaction::Eip1559(tx)
-        ).await?;
+            TypedTransaction::Eip1559(tx),
+        )
+        .await?;
         let pending = self.provider.send_tx_envelope(envelope).await?;
         Ok(pending)
     }

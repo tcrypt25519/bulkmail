@@ -1,48 +1,52 @@
-//! Parallel EIP-1559 transaction sender for Ethereum.
+//! Parallel transaction sender with pluggable chain adapters.
 //!
-//! Bulkmail manages concurrent transaction submission to a fast EVM chain,
-//! handling nonce sequencing, gas pricing, retries, and stuck-transaction
-//! replacement.
+//! Bulkmail manages concurrent transaction submission, handling replay
+//! protection, fee pricing, retries, and stuck-transaction replacement.
+//! The library is generic over a [`ChainAdapter`] — currently Ethereum
+//! (EIP-1559) is supported, with Solana planned.
 //!
-//! ## Usage
+//! ## Usage (Ethereum)
 //!
 //! 1. Connect to a WebSocket endpoint using [`Chain::new`].
-//! 2. Create a [`Sender`] bound to a signing address via [`Sender::new`].
+//! 2. Create a [`Sender<Eth>`] via [`Sender::new`].
 //! 3. Submit [`Message`] values via [`Sender::add_message`].
 //! 4. Drive the send loop with [`Sender::run`].
 //!
 //! ## Design
 //!
-//! Nonces and gas prices are **late-bound** - assigned immediately before
+//! Nonces and gas prices are **late-bound** — assigned immediately before
 //! sending rather than at message creation. This allows messages to be
 //! re-queued and replaced without invalidating earlier assignments.
 //!
-//! Up to 16 transactions may be in-flight concurrently. Transactions that
-//! time out are replaced with a 20% higher priority fee, up to 3 times.
+//! Transactions that time out are replaced with a higher priority fee.
 //! Messages that exhaust retries are dropped with an error log.
 //!
+//! [`ChainAdapter`]: adapter::ChainAdapter
 //! [`Chain::new`]: Chain::new
 //! [`Sender::new`]: Sender::new
 //! [`Sender::add_message`]: Sender::add_message
 //! [`Sender::run`]: Sender::run
+//! [`Sender<Eth>`]: Sender
 
 use alloy::transports::{RpcError, TransportErrorKind};
 use thiserror::Error;
 
-pub mod message;
-pub mod sender;
+pub mod adapter;
 pub mod chain;
-mod gas_price;
+pub(crate) mod gas_price;
+pub mod message;
+pub(crate) mod nonce_manager;
 mod priority_queue;
-mod nonce_manager;
+pub mod sender;
 
 // Re-export main components for easier use
-pub use chain::{BlockReceiver, Chain, ChainClient};
-pub use sender::Sender;
-pub use message::Message;
+pub use adapter::ethereum::{Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy};
+pub use chain::{Chain, ChainClient as LegacyChainClient};
 pub(crate) use gas_price::GasPriceManager;
+pub use message::Message;
 pub(crate) use nonce_manager::NonceManager;
 pub(crate) use priority_queue::PriorityQueue;
+pub use sender::Sender;
 
 /// The top-level error type for the bulkmail library.
 #[derive(Error, Debug)]
@@ -92,4 +96,16 @@ pub enum Error {
     /// [`Chain`]: chain::Chain
     #[error("chain error: {0}")]
     ChainError(#[from] chain::Error),
+
+    /// A transaction was dropped or timed out without confirming.
+    #[error("transaction dropped: {0}")]
+    TransactionDropped(alloy::primitives::B256),
+
+    /// A transaction was confirmed but reverted on-chain.
+    #[error("transaction reverted: {0}")]
+    TransactionReverted(alloy::primitives::B256),
+
+    /// A subscription was closed unexpectedly.
+    #[error("subscription closed")]
+    SubscriptionClosed,
 }

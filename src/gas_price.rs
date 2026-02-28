@@ -1,9 +1,9 @@
 //! Network congestion detection and priority-fee scaling. See [`GasPriceManager`].
 
+use crate::message::MAX_PRIORITY;
 use crate::Error;
 use std::{collections::VecDeque, time::Duration};
 use tokio::sync::Mutex;
-use crate::message::MAX_PRIORITY;
 
 /// Maximum priority fee cap - 100 Gwei.
 const MAX_PRIORITY_FEE: u128 = 100_000_000_000;
@@ -239,7 +239,7 @@ mod tests {
         // Test high congestion
         for _ in 0..10 {
             manager
-                .update_on_confirmation(Duration::from_secs(70),1_000_000_000)
+                .update_on_confirmation(Duration::from_secs(70), 1_000_000_000)
                 .await;
         }
         let (_, priority_fee_high) = manager.get_gas_price(1).await.unwrap();

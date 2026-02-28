@@ -193,8 +193,7 @@ mod tests {
         let data = Bytes::default();
         let priority = 1;
         let deadline = None;
-        let message =
-            Message::new(to, gas, value, data, priority, deadline);
+        let message = Message::new(to, gas, value, data, priority, deadline);
 
         assert_eq!(message.priority, 1);
         assert_eq!(message.retry_count, 0);
@@ -208,8 +207,7 @@ mod tests {
         let data = Bytes::default();
         let priority = 1;
         let deadline = None;
-        let mut message =
-            Message::new(to, gas, value, data, priority, deadline);
+        let mut message = Message::new(to, gas, value, data, priority, deadline);
 
         assert_eq!(message.effective_priority(), 1);
 
@@ -230,8 +228,7 @@ mod tests {
         let data = Bytes::default();
         let priority = 1;
         let deadline = None;
-        let mut message =
-            Message::new(to, gas, value, data, priority, deadline);
+        let mut message = Message::new(to, gas, value, data, priority, deadline);
 
         assert!(message.can_retry());
 
@@ -287,7 +284,14 @@ mod tests {
 
     #[test]
     fn test_new_accepts_priority_at_max() {
-        let msg = Message::new(None, 21_000, U256::ZERO, Bytes::default(), MAX_PRIORITY, None);
+        let msg = Message::new(
+            None,
+            21_000,
+            U256::ZERO,
+            Bytes::default(),
+            MAX_PRIORITY,
+            None,
+        );
         assert_eq!(msg.priority, MAX_PRIORITY);
     }
 
