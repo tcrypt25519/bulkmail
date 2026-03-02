@@ -1,16 +1,14 @@
 //! Transaction orchestrator. See [`Sender`].
 
-use crate::{
-    Error, Message, PriorityQueue,
-    adapter::{
-        ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
-        RetryStrategy, SendOutcome,
-    },
-    clock::{Clock, SystemClock},
+use crate::adapter::{
+    ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
+    RetryStrategy, SendOutcome,
 };
+use crate::{Error, Message, PriorityQueue};
 use alloy::transports::RpcError::ErrorResp;
 use log::{debug, error};
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// Maximum number of transactions that may be in-flight simultaneously.
@@ -85,8 +83,7 @@ impl<A: ChainAdapter> Sender<A> {
     /// Enqueues `msg` for processing on the next available concurrency slot.
     pub async fn add_message(&self, msg: Message) {
         debug!("adding message {:?} {}", msg.to, msg.value);
-        let now_ms = SystemClock.now_ms();
-        self.queue.lock().await.push(msg, now_ms);
+        self.queue.lock().await.push(msg);
         self.message_ready.notify_one();
     }
 
@@ -139,11 +136,13 @@ impl<A: ChainAdapter> Sender<A> {
                 if let Err(e) = sender.process_message(msg).await {
                     match &e {
                         Error::ChainError(chain_err) => {
-                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err
-                                && resp.code == TX_FAILURE_INSUFFICIENT_FUNDS
-                            {
-                                error!("Insufficient funds to send transaction; dropping message");
-                                return;
+                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err {
+                                if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS {
+                                    error!(
+                                        "Insufficient funds to send transaction; dropping message"
+                                    );
+                                    return;
+                                }
                             }
                             error!("Error processing message: {:?}", e);
                         }
@@ -164,7 +163,6 @@ impl<A: ChainAdapter> Sender<A> {
     /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
         debug!("processing message {:?} {}", msg.to, msg.value);
-
         let now_ms = SystemClock.now_ms();
 
         if msg.is_expired(now_ms) {
@@ -294,15 +292,13 @@ impl<A: ChainAdapter> Sender<A> {
 #[cfg(test)]
 mod tests {
     use super::Sender;
-    use crate::{
-        Message,
-        adapter::ethereum::{
-            Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
-        },
-        chain,
+    use crate::adapter::ethereum::{
+        bump_by_percent, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy,
     };
+    use crate::{chain, Message};
     use alloy::primitives::Address;
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     // A minimal mock that satisfies NonceManager::new inside EthReplayProtection::new.
