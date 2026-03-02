@@ -146,7 +146,13 @@ impl ChainClient<Eth> for EthClient {
             Ok(Some(receipt)) => {
                 if receipt.status() {
                     Ok(TransactionStatus::Confirmed {
-                        number: receipt.block_number.unwrap_or(0),
+                        number: receipt.block_number.unwrap_or_else(|| {
+                            warn!(
+                                "Receipt for transaction {:?} missing block number; defaulting to 0",
+                                tx_hash
+                            );
+                            0
+                        }),
                     })
                 } else {
                     Ok(TransactionStatus::Failed {
