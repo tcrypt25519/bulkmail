@@ -153,14 +153,9 @@ impl ChainClient for Chain {
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut sub = subscription;
-            loop {
-                match sub.recv().await {
-                    Ok(header) => {
-                        if tx.send(header).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(header) = sub.recv().await {
+                if tx.send(header).await.is_err() {
+                    break;
                 }
             }
         });

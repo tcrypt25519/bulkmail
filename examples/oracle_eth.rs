@@ -12,8 +12,6 @@ use tokio::time::sleep;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("hex decoding error: {0}")]
-    HexDecode(#[from] hex::FromHexError),
     #[error("transaction manager error: {0}")]
     TM(#[from] bulkmail::Error),
     #[error("chain error: {0}")]

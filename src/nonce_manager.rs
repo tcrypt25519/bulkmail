@@ -2,9 +2,9 @@
 
 use crate::{chain::ChainClient, Error};
 use alloy::primitives::Address;
+use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Nonce tracking state guarded by a single [`Mutex`].
 ///
@@ -61,8 +61,8 @@ impl NonceManager {
     ///
     /// Both the confirmed baseline and the in-flight set are accessed under a
     /// single lock to prevent two concurrent tasks from receiving the same nonce.
-    pub async fn get_next_available_nonce(&self) -> u64 {
-        let mut state = self.state.lock().await;
+    pub fn get_next_available_nonce(&self) -> u64 {
+        let mut state = self.state.lock();
 
         // Walk forward from the confirmed baseline using a local counter so
         // the confirmed-nonce field is never mutated here.
@@ -79,8 +79,8 @@ impl NonceManager {
     ///
     /// This method must be called when a transaction is dropped or fails before
     /// it is broadcast, so the nonce can be reused.
-    pub async fn mark_nonce_available(&self, nonce: u64) {
-        self.state.lock().await.in_flight.remove(&nonce);
+    pub fn mark_nonce_available(&self, nonce: u64) {
+        self.state.lock().in_flight.remove(&nonce);
     }
 
     /// Advances the confirmed-nonce baseline to `new_nonce` and prunes
@@ -88,8 +88,8 @@ impl NonceManager {
     ///
     /// This method is a no-op if `new_nonce` is not greater than the current
     /// baseline, preventing rollbacks on out-of-order confirmation callbacks.
-    pub async fn update_current_nonce(&self, new_nonce: u64) {
-        let mut state = self.state.lock().await;
+    pub fn update_current_nonce(&self, new_nonce: u64) {
+        let mut state = self.state.lock();
         if new_nonce > state.current {
             state.current = new_nonce;
             state.in_flight.retain(|&n| n >= new_nonce);
@@ -106,7 +106,7 @@ impl NonceManager {
     /// [`Sender::run`]: crate::Sender::run
     pub async fn sync_nonce(&self) -> Result<(), Error> {
         let on_chain_nonce = self.chain.get_account_nonce(self.address).await?;
-        self.update_current_nonce(on_chain_nonce).await;
+        self.update_current_nonce(on_chain_nonce);
         Ok(())
     }
 }
@@ -134,42 +134,42 @@ mod tests {
     #[tokio::test]
     async fn test_new_fetches_initial_nonce() {
         let nm = nonce_manager_at(7).await;
-        assert_eq!(nm.state.lock().await.current, 7);
+        assert_eq!(nm.state.lock().current, 7);
     }
 
     #[tokio::test]
     async fn test_sequential_assignment() {
         let nm = nonce_manager_at(0).await;
-        assert_eq!(nm.get_next_available_nonce().await, 0);
-        assert_eq!(nm.get_next_available_nonce().await, 1);
-        assert_eq!(nm.get_next_available_nonce().await, 2);
+        assert_eq!(nm.get_next_available_nonce(), 0);
+        assert_eq!(nm.get_next_available_nonce(), 1);
+        assert_eq!(nm.get_next_available_nonce(), 2);
     }
 
     #[tokio::test]
     async fn test_starts_from_offset() {
         // Initial on-chain nonce of 5; first local assignment must be 5.
         let nm = nonce_manager_at(5).await;
-        assert_eq!(nm.get_next_available_nonce().await, 5);
-        assert_eq!(nm.get_next_available_nonce().await, 6);
+        assert_eq!(nm.get_next_available_nonce(), 5);
+        assert_eq!(nm.get_next_available_nonce(), 6);
     }
 
     #[tokio::test]
     async fn test_mark_available_allows_reuse() {
         let nm = nonce_manager_at(0).await;
-        let n = nm.get_next_available_nonce().await; // assigns 0
-        nm.mark_nonce_available(n).await; // returns 0 to the pool
-                                          // next assignment should give 0 again
-        assert_eq!(nm.get_next_available_nonce().await, 0);
+        let n = nm.get_next_available_nonce(); // assigns 0
+        nm.mark_nonce_available(n); // returns 0 to the pool
+                                    // next assignment should give 0 again
+        assert_eq!(nm.get_next_available_nonce(), 0);
     }
 
     #[tokio::test]
     async fn test_update_advances_baseline_and_prunes_in_flight() {
         let nm = nonce_manager_at(0).await;
-        nm.get_next_available_nonce().await; // 0 in-flight
-        nm.get_next_available_nonce().await; // 1 in-flight
-                                             // Confirming nonce 2 should prune both 0 and 1.
-        nm.update_current_nonce(2).await;
-        let state = nm.state.lock().await;
+        nm.get_next_available_nonce(); // 0 in-flight
+        nm.get_next_available_nonce(); // 1 in-flight
+                                       // Confirming nonce 2 should prune both 0 and 1.
+        nm.update_current_nonce(2);
+        let state = nm.state.lock();
         assert_eq!(state.current, 2);
         assert!(state.in_flight.is_empty());
     }
@@ -178,19 +178,19 @@ mod tests {
     async fn test_update_ignores_rollback() {
         let nm = nonce_manager_at(10).await;
         // A lower value must not roll back the baseline.
-        nm.update_current_nonce(5).await;
-        assert_eq!(nm.state.lock().await.current, 10);
+        nm.update_current_nonce(5);
+        assert_eq!(nm.state.lock().current, 10);
     }
 
     #[tokio::test]
     async fn test_update_retains_higher_in_flight_nonces() {
         let nm = nonce_manager_at(0).await;
-        nm.get_next_available_nonce().await; // 0
-        nm.get_next_available_nonce().await; // 1
-        nm.get_next_available_nonce().await; // 2
-                                             // Confirming up to 1 should prune 0 but keep 1 and 2.
-        nm.update_current_nonce(1).await;
-        let in_flight = nm.state.lock().await.in_flight.clone();
+        nm.get_next_available_nonce(); // 0
+        nm.get_next_available_nonce(); // 1
+        nm.get_next_available_nonce(); // 2
+                                       // Confirming up to 1 should prune 0 but keep 1 and 2.
+        nm.update_current_nonce(1);
+        let in_flight = nm.state.lock().in_flight.clone();
         assert!(!in_flight.contains(&0), "nonce 0 is below the new baseline");
         assert!(in_flight.contains(&1), "nonce 1 is at the new baseline");
         assert!(in_flight.contains(&2), "nonce 2 is above the new baseline");
@@ -212,8 +212,8 @@ mod tests {
         let nm = NonceManager::new(Arc::new(mock), Address::default())
             .await
             .unwrap();
-        assert_eq!(nm.state.lock().await.current, 0);
+        assert_eq!(nm.state.lock().current, 0);
         nm.sync_nonce().await.unwrap();
-        assert_eq!(nm.state.lock().await.current, 5);
+        assert_eq!(nm.state.lock().current, 5);
     }
 }

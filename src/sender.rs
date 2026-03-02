@@ -4,6 +4,7 @@ use crate::adapter::{
     ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
     RetryStrategy, SendOutcome,
 };
+use crate::clock::{Clock, SystemClock};
 use crate::{Error, Message, PriorityQueue};
 use alloy::transports::RpcError::ErrorResp;
 use log::{debug, error, warn};
@@ -86,7 +87,8 @@ impl<A: ChainAdapter> Sender<A> {
     /// Enqueues `msg` for processing on the next available concurrency slot.
     pub async fn add_message(&self, msg: Message) {
         debug!("adding message {:?} {}", msg.to, msg.value);
-        self.queue.lock().await.push(msg);
+        let now_ms = SystemClock.now_ms();
+        self.queue.lock().await.push(msg, now_ms);
         self.message_ready.notify_one();
     }
 
@@ -167,13 +169,18 @@ impl<A: ChainAdapter> Sender<A> {
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
         debug!("processing message {:?} {}", msg.to, msg.value);
 
-        if msg.is_expired() {
+        let now_ms = SystemClock.now_ms();
+
+        if msg.is_expired(now_ms) {
             return Err(Error::MessageExpired);
         }
 
         // Late-bind replay token (nonce / blockhash) and fees
         let replay_token = self.replay.next().await;
-        let fee = self.fees.get_fee_params(msg.effective_priority()).await?;
+        let fee = self
+            .fees
+            .get_fee_params(msg.effective_priority(now_ms))
+            .await?;
 
         // Send the transaction
         self.send_and_watch(msg, fee, replay_token, 0).await
@@ -187,8 +194,9 @@ impl<A: ChainAdapter> Sender<A> {
         replay_token: A::ReplayToken,
         replacement_count: u32,
     ) -> Result<(), Error> {
+        let now_ms = SystemClock.now_ms();
         // Ensure the message is still valid
-        if msg.is_expired() {
+        if msg.is_expired(now_ms) {
             return Err(Error::MessageExpired);
         }
 
