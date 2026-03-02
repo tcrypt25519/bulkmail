@@ -254,6 +254,10 @@ impl ReplayProtection<Eth> for EthReplayProtection {
     async fn sync(&self) -> Result<(), Error> {
         self.inner.sync_nonce().await
     }
+
+    async fn release(&self, token: &u64) {
+        self.inner.mark_nonce_available(*token);
+    }
 }
 
 // ── EthRetryStrategy ────────────────────────────────────────────────────────
