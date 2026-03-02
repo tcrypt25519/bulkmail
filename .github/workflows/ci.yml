@@ -30,6 +30,9 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
       - name: Cache dependencies
         uses: actions/cache@v4
         with:
@@ -49,6 +52,9 @@ jobs:
 
       - name: Format check
         run: cargo fmt --check
+
+      - name: Audit
+        run: cargo audit
 
   coverage:
     if: (github.event.action != 'closed' || github.event.pull_request.merged == true)
