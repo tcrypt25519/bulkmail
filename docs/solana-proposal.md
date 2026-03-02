@@ -704,6 +704,11 @@ This approach:
 - **Uses block height for expiry** — not wall-clock time. The chain's own
   block height is the only reliable source of truth for blockhash validity.
 
+**Note:** If multiple transactions are watched concurrently, consider batching
+signature status checks. A centralized watcher can collect signatures from
+all in-flight transactions and call `getSignatureStatuses` once per slot,
+then fan out results to reduce RPC load.
+
 ### 4.11 Transaction Timeout
 
 On Ethereum, `TX_TIMEOUT = 3s` is used. On Solana, transactions are naturally
