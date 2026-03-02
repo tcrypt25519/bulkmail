@@ -1,8 +1,8 @@
 # Bulkmail
 
-![Build Status](https://github.com/tyler-smith/bulkmail/actions/workflows/ci.yml/badge.svg)
+![Build Status](https://github.com/tcrypt25519/bulkmail/actions/workflows/ci.yml/badge.svg)
 
-A parallel transaction sender for Ethereum, designed to handle concurrent transaction sending to a rapid EVM blockchain.
+A parallel transaction sender with pluggable chain adapters (Ethereum today, Solana planned).
 
 ## Docs
 
@@ -25,19 +25,32 @@ A parallel transaction sender for Ethereum, designed to handle concurrent transa
 
 ## Getting Started
 
-### Cloning the Repository
-
-To get started with Bulkmail, clone the repository to your local machine:
-
-```bash
-git clone https://github.com/tyler-smith/bulkmail.git
-cd bulkmail
-```
-
 ### Building the Project
 
 ```bash
 cargo build
+```
+
+### Quick Start (Ethereum)
+
+```rust
+use bulkmail::{
+    Chain, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, Message, Sender,
+};
+use alloy::primitives::Address;
+use std::sync::Arc;
+
+# async fn run(chain: Chain, signer: Address) -> Result<(), bulkmail::Error> {
+let chain_arc: Arc<dyn bulkmail::LegacyChainClient> = Arc::new(chain.clone());
+let client = Arc::new(EthClient::new(chain_arc.clone()));
+let fees = Arc::new(EthFeeManager::new());
+let replay = Arc::new(EthReplayProtection::new(chain_arc, signer).await?);
+let retry = Arc::new(EthRetryStrategy::new());
+
+let sender = Sender::<Eth>::new(client, fees, replay, retry);
+sender.add_message(Message::default()).await;
+sender.run().await
+# }
 ```
 
 ## Running the Oracle Simulation
@@ -45,7 +58,7 @@ cargo build
 Bulkmail includes an `oracle` program that simulates the system's behavior. To run it:
 
 ```bash
-cargo run --bin oracle
+cargo run --example oracle_eth
 ```
 
 ## Running Tests
@@ -57,4 +70,4 @@ cargo test
 ## Project Structure
 
 - `src/`: Contains the main library code
-- `src/bin/`: Contains the `oracle` simulation program
+- `examples/`: Example programs (e.g., `oracle_eth.rs`)
