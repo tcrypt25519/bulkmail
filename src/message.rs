@@ -175,8 +175,17 @@ impl Default for Message {
 
 impl Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Message {{ to: {:?}, value: {}, gas: {}, priority: {}, deadline: {:?}, created_at: {:?}, retry_count: {} }}",
-               self.to, self.value, self.gas, self.priority, self.deadline, self.created_at, self.retry_count)
+        write!(
+            f,
+            "Message {{ to: {:?}, value: {}, gas: {}, priority: {}, deadline: {:?}, created_at: {:?}, retry_count: {} }}",
+            self.to,
+            self.value,
+            self.gas,
+            self.priority,
+            self.deadline,
+            self.created_at,
+            self.retry_count
+        )
     }
 }
 

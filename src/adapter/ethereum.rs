@@ -6,15 +6,16 @@
 //! [`Sender<Eth>`]: crate::Sender
 
 use crate::{
+    Error, GasPriceManager, NonceManager,
     adapter::{
         BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
         RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
     },
-    chain, Error, GasPriceManager, NonceManager,
+    chain,
 };
 use alloy::{
     consensus::TxEip1559,
-    primitives::{Address, TxKind, B256},
+    primitives::{Address, B256, TxKind},
 };
 use async_trait::async_trait;
 use log::{error, info, warn};

@@ -3,7 +3,7 @@
 use alloy::{
     consensus::{TxEip1559, TypedTransaction},
     network::{Ethereum, EthereumWallet, NetworkWallet},
-    primitives::{Address, BlockNumber, B256},
+    primitives::{Address, B256, BlockNumber},
     providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect},
     rpc::types::{Header, TransactionReceipt},
     signers::{k256::ecdsa::SigningKey, local::PrivateKeySigner},

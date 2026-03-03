@@ -1,11 +1,11 @@
 //! Transaction orchestrator. See [`Sender`].
 
 use crate::{
+    Error, Message, PriorityQueue,
     adapter::{
         ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
         RetryStrategy, SendOutcome,
     },
-    Error, Message, PriorityQueue,
 };
 use alloy::transports::RpcError::ErrorResp;
 use log::{debug, error, warn};
@@ -278,10 +278,11 @@ impl<A: ChainAdapter> Sender<A> {
 mod tests {
     use super::Sender;
     use crate::{
+        Message,
         adapter::ethereum::{
-            bump_by_percent, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy,
+            Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
         },
-        chain, Message,
+        chain,
     };
     use alloy::primitives::Address;
     use std::{sync::Arc, time::Duration};
