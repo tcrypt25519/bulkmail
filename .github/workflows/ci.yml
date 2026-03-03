@@ -1,83 +1,37 @@
+---
 name: CI
+
 on:
   push:
-    branches: [ master ]
-    tags: [ '*' ]
+    branches: [master]
+    tags: ["*"]
   pull_request:
-    branches: [ '*' ]
+    branches: ["*"]
 
 concurrency:
   group: build-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  build_and_test:
+  check-rust:
     if: (github.event.action != 'closed' || github.event.pull_request.merged == true)
-    name: Build, test, and lint
+    name: Check Rust
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write         # needed for commit-changes push
+      pull-requests: write    # needed for PR comments (e.g., Codecov)
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          components: clippy
+          fetch-depth: 0      # required for commit & rebase in shared action
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
+      - name: Run shared Rust checks
+        uses: tcrypt25519/ci/.github/actions/check-rust@main
         with:
-          path: |
-            ~/.cargo
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --verbose
-
-      - name: Run tests
-        run: cargo nextest run
-
-      - name: Clippy
-        run: cargo clippy
-
-  coverage:
-    if: (github.event.action != 'closed' || github.event.pull_request.merged == true)
-    name: Code coverage
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: llvm-tools-preview
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo
-            target/
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --lcov --output-path lcov.info
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          run-coverage: true
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
