@@ -139,7 +139,7 @@ impl ChainAdapter for AdapterHappy {
 
 #[tokio::test]
 async fn sender_processes_message_with_adapter() {
-    let (tx, rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel::<u64>(1);
     let send_called = Arc::new(AtomicBool::new(false));
     let client = ClientHappy {
         receiver: Arc::new(Mutex::new(Some(rx))),
@@ -148,9 +148,9 @@ async fn sender_processes_message_with_adapter() {
 
     let sender = Sender::<AdapterHappy>::new(
         Arc::new(client),
-        Arc::new(FeeHappy::default()),
+        Arc::new(FeeHappy),
         Arc::new(ReplayHappy::new(0)),
-        Arc::new(RetryHappy::default()),
+        Arc::new(RetryHappy),
     );
 
     sender.add_message(Message::default()).await;
@@ -304,16 +304,16 @@ impl ChainAdapter for AdapterFeeErr {
 
 #[tokio::test]
 async fn releases_replay_token_on_fee_error() {
-    let (tx, rx) = mpsc::channel(1);
+    let (_tx, rx) = mpsc::channel::<u64>(1);
     let replay = Arc::new(ReplayFeeErr::new());
 
     let sender = Sender::<AdapterFeeErr>::new(
         Arc::new(ClientNoop {
             receiver: Arc::new(Mutex::new(Some(rx))),
         }),
-        Arc::new(FeeFail::default()),
+        Arc::new(FeeFail),
         replay.clone(),
-        Arc::new(RetryNoop::default()),
+        Arc::new(RetryNoop),
     );
 
     sender.add_message(Message::default()).await;
@@ -475,7 +475,7 @@ impl ChainAdapter for AdapterResubmit {
 
 #[tokio::test]
 async fn resubmit_reuses_replay_token() {
-    let (tx, rx) = mpsc::channel(2);
+    let (_tx, rx) = mpsc::channel::<u64>(1);
 
     let replay = Arc::new(ReplayResubmit::new());
 
@@ -486,7 +486,7 @@ async fn resubmit_reuses_replay_token() {
 
     let sender = Sender::<AdapterResubmit>::new(
         client.clone(),
-        Arc::new(FeeResubmit::default()),
+        Arc::new(FeeResubmit),
         replay.clone(),
         Arc::new(RetryResubmit {
             called: AtomicBool::new(false),
@@ -636,7 +636,7 @@ impl ChainAdapter for AdapterRequeue {
 
 #[tokio::test]
 async fn requeue_releases_replay_token() {
-    let (tx, rx) = mpsc::channel(1);
+    let (_tx, rx) = mpsc::channel::<u64>(2);
 
     let replay = Arc::new(ReplayRequeue::new());
 
@@ -644,7 +644,7 @@ async fn requeue_releases_replay_token() {
         Arc::new(ClientDropping {
             receiver: Arc::new(Mutex::new(Some(rx))),
         }),
-        Arc::new(FeeRequeue::default()),
+        Arc::new(FeeRequeue),
         replay.clone(),
         Arc::new(RetryRequeue),
     );
@@ -662,6 +662,162 @@ async fn requeue_releases_replay_token() {
     })
     .await
     .expect("replay token not released on requeue");
+
+    run_handle.abort();
+}
+
+// -----------------------------------------------------------------------------
+// Adapter: Abandon releases token
+// -----------------------------------------------------------------------------
+#[derive(Debug)]
+struct AdapterAbandon;
+
+#[derive(Debug, Default)]
+struct FeeAbandon;
+
+#[async_trait]
+impl FeeManager<AdapterAbandon> for FeeAbandon {
+    async fn get_fee_params(&self, _priority: u32) -> Result<u64, Error> {
+        Ok(1)
+    }
+
+    async fn update_on_confirmation(&self, _confirmation_time: Duration, _fee_paid: &u64) {}
+
+    fn bump_fee(&self, current: &u64) -> u64 {
+        current.saturating_add(1)
+    }
+
+    async fn get_base_fee(&self) -> u64 {
+        1
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClientAbandon {
+    receiver: Arc<Mutex<Option<BlockReceiver>>>,
+}
+
+#[async_trait]
+impl ChainClient<AdapterAbandon> for ClientAbandon {
+    async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error> {
+        self.receiver
+            .lock()
+            .expect("receiver lock poisoned")
+            .take()
+            .ok_or(Error::SubscriptionClosed)
+    }
+
+    async fn get_block_number(&self) -> Result<u64, Error> {
+        Ok(0)
+    }
+
+    async fn send_transaction(
+        &self,
+        _msg: &Message,
+        _fee: &u64,
+        _replay_token: &u64,
+    ) -> Result<SendOutcome<AdapterAbandon>, Error> {
+        Ok(SendOutcome::Dropped { tx_id: 1 })
+    }
+
+    async fn get_transaction_status(&self, _id: &u64) -> Result<TransactionStatus, Error> {
+        Ok(TransactionStatus::Pending)
+    }
+}
+
+#[derive(Debug)]
+struct ReplayAbandon {
+    released: AtomicBool,
+    next_value: AtomicU64,
+}
+
+impl ReplayAbandon {
+    fn new() -> Self {
+        Self {
+            released: AtomicBool::new(false),
+            next_value: AtomicU64::new(11),
+        }
+    }
+}
+
+#[async_trait]
+impl ReplayProtection<AdapterAbandon> for ReplayAbandon {
+    async fn next(&self) -> u64 {
+        self.next_value.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn sync(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn release(&self, _token: &u64) {
+        self.released.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct RetryAbandon;
+
+#[async_trait]
+impl RetryStrategy<AdapterAbandon> for RetryAbandon {
+    async fn handle_dropped(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<AdapterAbandon>,
+        _client: &ClientAbandon,
+        _fees: &FeeAbandon,
+        _replay: &ReplayAbandon,
+    ) -> RetryDecision<AdapterAbandon> {
+        RetryDecision::Abandon
+    }
+
+    async fn handle_confirmed(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<AdapterAbandon>,
+        _fees: &FeeAbandon,
+        _replay: &ReplayAbandon,
+        _confirmation_time: Duration,
+    ) {
+    }
+}
+
+impl ChainAdapter for AdapterAbandon {
+    type FeeParams = u64;
+    type ReplayToken = u64;
+    type TxId = u64;
+    type Client = ClientAbandon;
+    type FeeManager = FeeAbandon;
+    type ReplayProtection = ReplayAbandon;
+    type RetryStrategy = RetryAbandon;
+}
+
+#[tokio::test]
+async fn abandon_releases_replay_token() {
+    let (_tx, rx) = mpsc::channel::<u64>(1);
+
+    let replay = Arc::new(ReplayAbandon::new());
+
+    let sender = Sender::<AdapterAbandon>::new(
+        Arc::new(ClientAbandon {
+            receiver: Arc::new(Mutex::new(Some(rx))),
+        }),
+        Arc::new(FeeAbandon),
+        replay.clone(),
+        Arc::new(RetryAbandon),
+    );
+
+    sender.add_message(Message::default()).await;
+
+    let run_sender = sender.clone();
+    let run_handle = tokio::spawn(async move { run_sender.run().await });
+
+    // Wait for release flag to be set
+    timeout(Duration::from_secs(2), async {
+        while !replay.released.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replay token not released on abandon");
 
     run_handle.abort();
 }
