@@ -1,7 +1,6 @@
 //! Network congestion detection and priority-fee scaling. See [`GasPriceManager`].
 
-use crate::message::MAX_PRIORITY;
-use crate::Error;
+use crate::{Error, message::MAX_PRIORITY};
 use parking_lot::Mutex;
 use std::{collections::VecDeque, time::Duration};
 

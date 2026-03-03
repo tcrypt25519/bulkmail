@@ -1,15 +1,14 @@
 //! Alloy WebSocket wrapper for Ethereum interaction. See [`Chain`] and [`ChainClient`].
 
-use alloy::consensus::{TxEip1559, TypedTransaction};
-use alloy::network::{Ethereum, EthereumWallet, NetworkWallet};
-use alloy::primitives::{Address, BlockNumber, B256};
-use alloy::providers::{
-    DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect,
+use alloy::{
+    consensus::{TxEip1559, TypedTransaction},
+    network::{Ethereum, EthereumWallet, NetworkWallet},
+    primitives::{Address, B256, BlockNumber},
+    providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect},
+    rpc::types::{Header, TransactionReceipt},
+    signers::{k256::ecdsa::SigningKey, local::PrivateKeySigner},
+    transports::{RpcError, TransportErrorKind},
 };
-use alloy::rpc::types::{Header, TransactionReceipt};
-use alloy::signers::k256::ecdsa::SigningKey;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;

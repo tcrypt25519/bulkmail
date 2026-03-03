@@ -1,10 +1,9 @@
 //! In-flight nonce tracking and per-block synchronization. See [`NonceManager`].
 
-use crate::{chain::ChainClient, Error};
+use crate::{Error, chain::ChainClient};
 use alloy::primitives::Address;
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 /// Nonce tracking state guarded by a single [`Mutex`].
 ///
@@ -158,7 +157,7 @@ mod tests {
         let nm = nonce_manager_at(0).await;
         let n = nm.get_next_available_nonce(); // assigns 0
         nm.mark_nonce_available(n); // returns 0 to the pool
-                                    // next assignment should give 0 again
+        // next assignment should give 0 again
         assert_eq!(nm.get_next_available_nonce(), 0);
     }
 
@@ -167,7 +166,7 @@ mod tests {
         let nm = nonce_manager_at(0).await;
         nm.get_next_available_nonce(); // 0 in-flight
         nm.get_next_available_nonce(); // 1 in-flight
-                                       // Confirming nonce 2 should prune both 0 and 1.
+        // Confirming nonce 2 should prune both 0 and 1.
         nm.update_current_nonce(2);
         let state = nm.state.lock();
         assert_eq!(state.current, 2);
@@ -188,7 +187,7 @@ mod tests {
         nm.get_next_available_nonce(); // 0
         nm.get_next_available_nonce(); // 1
         nm.get_next_available_nonce(); // 2
-                                       // Confirming up to 1 should prune 0 but keep 1 and 2.
+        // Confirming up to 1 should prune 0 but keep 1 and 2.
         nm.update_current_nonce(1);
         let in_flight = nm.state.lock().in_flight.clone();
         assert!(!in_flight.contains(&0), "nonce 0 is below the new baseline");
