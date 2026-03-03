@@ -1,24 +1,27 @@
 [package]
 name = "bulkmail"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Tyler Smith <mail@tcry.pt>"]
 description = "Transaction sending system"
 license = "MIT OR Apache-2.0"
 
-[features]
-# Opt-in structured logging via the tracing ecosystem.
-tracing = ["dep:tracing"]
-
 [dependencies]
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.49.0", features = ["full"] }
 async-trait = "0.1.89"
-parking_lot = "0.12"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 log = "0.4.29"
+env_logger = "0.10.2"
+dotenv = "0.15"
+chrono = "0.4.43"
 futures = "0.3.32"
 rand = "0.10.0"
+hex = "0.4"
 thiserror = "2.0.18"
-tracing = { version = "0.1", optional = true }
+secp256k1 = "0.31.1"
+parking_lot = "0.12.1"
+ethereum-types = "0.16.0"
 alloy = { version = "1.7.3", default-features = false, features = [
     "std",
     "provider-ws",
@@ -30,9 +33,12 @@ alloy = { version = "1.7.3", default-features = false, features = [
 alloy-node-bindings = "1.7.3"
 simple_logger = "5.2.0"
 
+
 [dev-dependencies]
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+tokio-test = "0.4.5"
+tokio = { version = "1.49.0", features = ["full", "test-util"] }
 mockall = "0.14.0"
+jsonrpc-core = "18"
 
 [[example]]
 name = "oracle_eth"
@@ -46,3 +52,10 @@ path = "src/lib.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false
+debug-assertions = true
+overflow-checks = true
