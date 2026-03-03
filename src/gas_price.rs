@@ -1,9 +1,9 @@
 //! Network congestion detection and priority-fee scaling. See [`GasPriceManager`].
 
+use crate::message::MAX_PRIORITY;
 use crate::Error;
 use parking_lot::Mutex;
 use std::{collections::VecDeque, time::Duration};
-use crate::message::MAX_PRIORITY;
 
 /// Maximum priority fee cap - 100 Gwei.
 const MAX_PRIORITY_FEE: u128 = 100_000_000_000;
@@ -147,11 +147,7 @@ impl GasPriceManager {
     /// This method appends `confirmation_time` to the rolling window (evicting the
     /// oldest sample when the window is full) and blends `used_priority_fee` into
     /// the running average using a simple 50/50 moving average.
-    pub fn update_on_confirmation(
-        &self,
-        confirmation_time: Duration,
-        used_priority_fee: u128,
-    ) {
+    pub fn update_on_confirmation(&self, confirmation_time: Duration, used_priority_fee: u128) {
         {
             let mut confirmation_times = self.confirmation_times.lock();
             confirmation_times.push_back(confirmation_time);

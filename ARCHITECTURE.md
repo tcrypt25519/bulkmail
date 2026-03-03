@@ -1,8 +1,8 @@
 # Architecture
 
-Bulkmail is a parallel EIP-1559 transaction sender library for Ethereum. It accepts
+Bulkmail is a parallel transaction sender with pluggable chain adapters. It accepts
 a stream of `Message` values from callers and lands them on-chain concurrently,
-managing nonces, gas prices, timeouts, and stuck-transaction replacement automatically.
+managing replay protection, fee pricing, timeouts, and retries automatically.
 
 ---
 
@@ -12,16 +12,16 @@ managing nonces, gas prices, timeouts, and stuck-transaction replacement automat
 Caller → add_message → PriorityQueue
                               ↓
               Sender::run (tokio::select! loop)
-               ├─ new block → NonceManager::sync_nonce
+               ├─ new block → ReplayProtection::sync
                └─ semaphore slot + queued message
                        ↓
                  spawned task
-                  ├─ NonceManager::get_next_available_nonce
-                  ├─ GasPriceManager::get_gas_price
+                  ├─ ReplayProtection::next
+                  ├─ FeeManager::get_fee_params
                   ├─ ChainClient::send_transaction
                   └─ wait for confirmation / timeout
-                         ├─ confirmed → update trackers
-                         └─ timeout  → bump fee 20%, retry (up to 3×)
+                         ├─ confirmed → retry.handle_confirmed
+                         └─ dropped   → retry.handle_dropped
 ```
 
 ---
@@ -31,13 +31,15 @@ Caller → add_message → PriorityQueue
 | File | Role |
 |------|------|
 | `src/lib.rs` | Public API surface; top-level `Error` enum |
-| `src/sender.rs` | Orchestrator; owns the queue, pending map, and semaphore |
+| `src/sender.rs` | Orchestrator; owns the queue and semaphore |
 | `src/message.rs` | `Message` struct; `effective_priority` calculation |
-| `src/chain.rs` | `ChainClient` trait + `Chain` implementation (Alloy WebSocket) |
+| `src/adapter/mod.rs` | Chain-agnostic adapter traits |
+| `src/adapter/ethereum.rs` | Ethereum adapter implementation |
+| `src/chain.rs` | Legacy `Chain` client (Alloy WebSocket wrapper) |
 | `src/nonce_manager.rs` | In-flight nonce tracking; per-block sync |
 | `src/gas_price.rs` | Congestion detection; priority-fee scaling |
 | `src/priority_queue.rs` | Max-heap over `effective_priority` |
-| `src/bin/oracle.rs` | Anvil-based simulation; not part of the library |
+| `examples/oracle_eth.rs` | Anvil-based simulation; not part of the library |
 
 ---
 
@@ -48,10 +50,8 @@ Caller → add_message → PriorityQueue
 The top-level orchestrator. It owns:
 
 - A `PriorityQueue` (behind `Arc<Mutex<_>>`) for pending messages.
-- A `HashMap<TxHash, PendingTransaction>` (behind `Arc<Mutex<_>>`) for in-flight transactions.
 - A `Semaphore` capped at `MAX_IN_FLIGHT_TRANSACTIONS = 16`.
-- A `NonceManager` and `GasPriceManager` (both `Arc`-wrapped for sharing across tasks).
-- An `Arc<dyn ChainClient>` for all chain interaction.
+- Adapter components: `ChainClient`, `FeeManager`, `ReplayProtection`, and `RetryStrategy`.
 
 `run()` drives a `tokio::select!` loop:
 
@@ -59,7 +59,7 @@ The top-level orchestrator. It owns:
 loop {
     select! {
         Some(header) = block_stream.recv() => {
-            nonce_manager.sync_nonce()
+            replay.sync()
         }
         permit = semaphore.acquire_owned() => {
             if let Some(msg) = queue.pop() {
@@ -88,9 +88,9 @@ Public fields:
 | `data` | `Bytes` | Call data |
 | `gas` | `u64` | Gas limit |
 | `priority` | `u32` | Caller-assigned priority (0–100; values above 100 are clamped) |
-| `deadline` | `Option<DateTime<Utc>>` | Discard-after timestamp |
+| `deadline_ms` | `Option<u32>` | Relative deadline in milliseconds from `created_at_ms` |
 
-Private fields (`created_at: Instant`, `retry_count: u32`) are managed by the
+Private fields (`created_at_ms: u64`, `retry_count: u32`) are managed by the
 library and are not settable by callers.
 
 **Effective priority formula:**
@@ -99,7 +99,7 @@ library and are not settable by callers.
 effective_priority = priority + retry_count + age_factor + deadline_factor
 ```
 
-- `age_factor` grows one point per two seconds of wall time.
+- `age_factor` grows one point per two seconds of wall time (based on epoch ms).
 - `deadline_factor` is `MAX_PRIORITY (100)` when fewer than 2 blocks remain,
   `MAX_PRIORITY/3` when fewer than 10 blocks remain, and 0 otherwise.
 - A message whose deadline has already passed returns 0, causing it to be
@@ -107,46 +107,30 @@ effective_priority = priority + retry_count + age_factor + deadline_factor
 
 ---
 
-### ChainClient trait and Chain (`src/chain.rs`)
+### Chain Clients (`src/adapter/mod.rs`, `src/chain.rs`)
 
-`ChainClient` is the interface `Sender` and `NonceManager` use for all chain
-operations:
+The adapter-level `ChainClient` trait in `src/adapter/mod.rs` is the interface
+used by `Sender` and adapter components. It exposes subscription, send, and
+status-check operations in a chain-agnostic way.
 
-```rust
-#[async_trait]
-pub trait ChainClient: Send + Sync {
-    fn id(&self) -> u64;
-    async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error>;
-    async fn get_block_number(&self) -> Result<BlockNumber, Error>;
-    async fn get_account_nonce(&self, address: Address) -> Result<u64, Error>;
-    async fn get_receipt(&self, tx_hash: B256) -> Result<Option<TransactionReceipt>, Error>;
-    async fn send_transaction(&self, tx: TxEip1559) -> Result<PendingTransactionBuilder<Ethereum>, Error>;
-}
-```
+`Chain` in `src/chain.rs` is the legacy Ethereum WebSocket client that wraps
+Alloy’s provider and signer. The Ethereum adapter (`src/adapter/ethereum.rs`)
+wraps this legacy client inside `EthClient` to satisfy the adapter trait.
 
-`BlockReceiver = mpsc::Receiver<Header>` is the return type of
-`subscribe_new_blocks`. Using a plain channel instead of Alloy's `Subscription`
-type makes the trait mockable in tests.
-
-`Chain` is the production implementation. It wraps Alloy's WebSocket provider
-and an `EthereumWallet` for signing. `subscribe_new_blocks` subscribes to the
-Alloy block stream and bridges it into an mpsc channel via a background task.
-
-Under `#[cfg(test)]`, `mockall` generates a `MockChainClient` automatically from
-the `#[automock]` attribute on the trait.
+`BlockReceiver = mpsc::Receiver<u64>` is used for block/slot notifications,
+keeping the adapter interface mockable and easy to test.
 
 ---
 
 ### NonceManager (`src/nonce_manager.rs`)
 
-Maintains two pieces of state protected by separate `tokio::sync::Mutex`es:
+Maintains two pieces of state guarded by a single mutex:
 
-- `current_nonce: u64` — the on-chain confirmed nonce.
-- `in_flight_nonces: BTreeSet<u64>` — nonces assigned to outstanding transactions.
+- `current: u64` — the on-chain confirmed nonce.
+- `in_flight: BTreeSet<u64>` — nonces assigned to outstanding transactions.
 
-`get_next_available_nonce` holds both locks simultaneously to prevent two concurrent
-tasks from receiving the same nonce. It walks forward from `current_nonce` until
-it finds a gap in the in-flight set.
+`get_next_available_nonce` holds the lock while walking forward from `current`
+until it finds a gap in the in-flight set.
 
 `sync_nonce` is called on every new block. It fetches `eth_getTransactionCount`
 and calls `update_current_nonce`, which advances the baseline and prunes any

@@ -93,9 +93,9 @@ impl Default for PriorityQueue {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
     use super::*;
     use crate::{Error, Message};
+    use alloy::primitives::Address;
 
     const NOW_MS: u64 = 1_000_000; // arbitrary fixed "now" for tests
 
@@ -103,7 +103,15 @@ mod tests {
     fn test_priority_queue_pops_in_priority_order() -> Result<(), Error> {
         let mut queue = PriorityQueue::new();
         for priority in [0u32, 1, 2] {
-            let msg = Message::new(Some(Address::default()), 21_000, Default::default(), Default::default(), priority, None, NOW_MS);
+            let msg = Message::new(
+                Some(Address::default()),
+                21_000,
+                Default::default(),
+                Default::default(),
+                priority,
+                None,
+                NOW_MS,
+            );
             queue.push(msg, NOW_MS);
         }
 
@@ -120,11 +128,33 @@ mod tests {
 
     #[test]
     fn test_prioritized_message_ordering() -> Result<(), Error> {
-        let msg1 = Message::new(None, 0, Default::default(), Default::default(), 1, None, NOW_MS);
-        let msg2 = Message::new(None, 0, Default::default(), Default::default(), 2, None, NOW_MS);
+        let msg1 = Message::new(
+            None,
+            0,
+            Default::default(),
+            Default::default(),
+            1,
+            None,
+            NOW_MS,
+        );
+        let msg2 = Message::new(
+            None,
+            0,
+            Default::default(),
+            Default::default(),
+            2,
+            None,
+            NOW_MS,
+        );
 
-        let pm1 = PrioritizedMessage { message: msg1, effective_priority: 1 };
-        let pm2 = PrioritizedMessage { message: msg2, effective_priority: 2 };
+        let pm1 = PrioritizedMessage {
+            message: msg1,
+            effective_priority: 1,
+        };
+        let pm2 = PrioritizedMessage {
+            message: msg2,
+            effective_priority: 2,
+        };
 
         assert!(pm1 < pm2);
         assert_eq!(pm1.cmp(&pm2), Ordering::Less);

@@ -34,9 +34,9 @@ simple_logger = "5.2.0"
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 mockall = "0.14.0"
 
-[[bin]]
-name = "oracle"
-path = "src/bin/oracle.rs"
+[[example]]
+name = "oracle_eth"
+path = "examples/oracle_eth.rs"
 
 [lib]
 name = "bulkmail"

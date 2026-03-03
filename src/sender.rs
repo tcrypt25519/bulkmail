@@ -1,75 +1,43 @@
 //! Transaction orchestrator. See [`Sender`].
 
-use crate::{chain, chain::ChainClient, Error, GasPriceManager, Message, NonceManager, PriorityQueue};
-use crate::clock::{Clock, SystemClock};
-use alloy::consensus::TxEip1559;
-use alloy::network::Ethereum;
-use alloy::primitives::{TxHash, TxKind};
-use alloy::providers::PendingTransactionBuilder;
-use alloy::transports::RpcError::ErrorResp;
-use alloy::{
-    primitives::{Address, B256},
-    rpc::types::TransactionReceipt,
+use crate::adapter::{
+    ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
+    RetryStrategy, SendOutcome,
 };
-use log::{error, info, warn};
-use parking_lot::Mutex;
-use std::future::Future;
-use std::pin::Pin;
-use std::time::Duration;
-use std::{collections::HashMap, sync::Arc, time::Instant};
-use tokio::sync::{Notify, Semaphore};
+use crate::clock::{Clock, SystemClock};
+use crate::{Error, Message, PriorityQueue};
+use alloy::transports::RpcError::ErrorResp;
+use log::{debug, error};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// Maximum number of transactions that may be in-flight simultaneously.
 const MAX_IN_FLIGHT_TRANSACTIONS: usize = 16;
 
-/// Maximum number of times a stuck transaction may be replaced with a higher fee.
-const MAX_REPLACEMENTS: u32 = 3;
-
-/// Percentage by which the priority fee is increased on each replacement.
-const GAS_PRICE_INCREASE_PERCENT: u8 = 20;
-
-/// Seconds to wait for a transaction to confirm before treating it as dropped.
-const TX_TIMEOUT: u64 = 3;
-
 /// JSON-RPC error code returned when the sender has insufficient funds.
 const TX_FAILURE_INSUFFICIENT_FUNDS: i64 = -32003;
 
-type PendingMap = HashMap<TxHash, PendingTransaction>;
-type SharedPendingMap = Arc<Mutex<PendingMap>>;
 type SharedQueue = Arc<Mutex<PriorityQueue>>;
 
-#[derive(Clone)]
-struct PendingTransaction {
-    msg: Message,
-    created_at: Instant,
-    replacement_count: u32,
-    priority_fee: u128,
-    nonce: u64,
-}
-
-/// An orchestrator that manages concurrent EIP-1559 transaction submission.
+/// An orchestrator that manages concurrent transaction submission.
 ///
-/// [`Sender`] owns the priority queue, the in-flight pending map, and all
-/// shared resources (nonce manager, gas-price manager, semaphore).
+/// [`Sender`] is generic over a [`ChainAdapter`], which binds all chain-specific
+/// components (client, fee manager, replay protection, retry strategy) together.
+///
 /// Callers add [`Message`] values via [`add_message`] and then drive
 /// processing by calling [`run`], which blocks until an unrecoverable error
 /// occurs.
 ///
-/// Up to [`MAX_IN_FLIGHT_TRANSACTIONS`] (16) messages are processed
-/// concurrently. Each message is handled in its own spawned task. A semaphore
-/// prevents the queue from being consumed faster than the concurrency limit
-/// allows.
-///
 /// [`add_message`]: Self::add_message
 /// [`run`]: Self::run
-#[derive(Clone)]
-pub struct Sender {
-    chain: Arc<dyn ChainClient>,
-    nonce_manager: Arc<NonceManager>,
-    gas_manager: Arc<GasPriceManager>,
+pub struct Sender<A: ChainAdapter> {
+    client: Arc<A::Client>,
+    fees: Arc<A::FeeManager>,
+    replay: Arc<A::ReplayProtection>,
+    retry: Arc<A::RetryStrategy>,
 
     queue: SharedQueue,
-    pending: SharedPendingMap,
     max_in_flight: Arc<Semaphore>,
     /// Notified by [`add_message`] so that [`process_next_message`] can sleep
     /// instead of spinning when the queue is empty.
@@ -79,41 +47,58 @@ pub struct Sender {
     message_ready: Arc<Notify>,
 }
 
-impl Sender {
-    /// Creates a new [`Sender`] connected to `chain` and bound to `address`.
-    ///
-    /// `address` is used to fetch the initial nonce and to sync nonces on
-    /// each new block. It must correspond to the signing key held by `chain`.
-    pub async fn new(chain: Arc<dyn ChainClient>, address: Address) -> Result<Self, Error> {
-        Ok(Self {
-            chain: chain.clone(),
-            nonce_manager: Arc::new(NonceManager::new(chain.clone(), address).await?),
-            gas_manager: Arc::new(GasPriceManager::new()),
+impl<A: ChainAdapter> Clone for Sender<A> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            fees: self.fees.clone(),
+            replay: self.replay.clone(),
+            retry: self.retry.clone(),
+            queue: self.queue.clone(),
+            max_in_flight: self.max_in_flight.clone(),
+            message_ready: self.message_ready.clone(),
+        }
+    }
+}
+
+impl<A: ChainAdapter> Sender<A> {
+    /// Creates a new [`Sender`] with the given adapter components.
+    pub fn new(
+        client: Arc<A::Client>,
+        fees: Arc<A::FeeManager>,
+        replay: Arc<A::ReplayProtection>,
+        retry: Arc<A::RetryStrategy>,
+    ) -> Self {
+        Self {
+            client,
+            fees,
+            replay,
+            retry,
 
             queue: Arc::new(Mutex::new(PriorityQueue::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
             max_in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TRANSACTIONS)),
             message_ready: Arc::new(Notify::new()),
-        })
+        }
     }
 
     /// Enqueues `msg` for processing on the next available concurrency slot.
-    pub fn add_message(&self, msg: Message) {
+    pub async fn add_message(&self, msg: Message) {
+        debug!("adding message {:?} {}", msg.to, msg.value);
         let now_ms = SystemClock.now_ms();
-        self.queue.lock().push(msg, now_ms);
+        self.queue.lock().await.push(msg, now_ms);
         self.message_ready.notify_one();
     }
 
     /// Drives the transaction send loop until an unrecoverable error occurs.
     ///
-    /// [`run`] subscribes to new block headers and processes messages from the
-    /// priority queue. On each new block the nonce is re-synced with the chain.
-    /// When a concurrency slot is free, the highest-priority queued message is
-    /// popped and processed in a spawned task.
+    /// [`run`] subscribes to new block/slot notifications and processes messages
+    /// from the priority queue. On each new block the replay protection state
+    /// is synced with the chain. When a concurrency slot is free, the highest-
+    /// priority queued message is popped and processed in a spawned task.
     ///
     /// [`run`]: Self::run
     pub async fn run(&self) -> Result<(), Error> {
-        let mut block_stream = self.chain.subscribe_new_blocks().await?;
+        let mut block_stream = self.client.subscribe_new_blocks().await?;
 
         loop {
             tokio::select! {
@@ -121,14 +106,12 @@ impl Sender {
 
                 block = block_stream.recv() => {
                     match block {
-                        Some(header) => {
-                            info!("new block {}", header.inner.number);
-                            self.nonce_manager.sync_nonce().await?
+                        Some(number) => {
+                            debug!("Received new block notification {}", number);
+                            self.replay.sync().await?;
                         }
                         None => {
-                            return Err(Error::ChainError(chain::Error::Subscription(
-                                "block stream closed unexpectedly".to_string(),
-                            )));
+                            return Err(Error::SubscriptionClosed);
                         }
                     }
                 }
@@ -140,28 +123,34 @@ impl Sender {
 
     /// Acquires a concurrency slot, then pops and dispatches the next message.
     ///
-    /// If the queue is empty, releases the slot and waits on [`message_ready`]
-    /// until [`add_message`] fires a notification.
-    ///
-    /// [`message_ready`]: Self::message_ready
-    /// [`add_message`]: Self::add_message
+    /// If the queue is empty, this method releases the slot and yields to the
+    /// executor before returning, avoiding a tight busy-loop.
     async fn process_next_message(&self) {
         // Block until we have a slot available
         let permit = self.max_in_flight.clone().acquire_owned().await.unwrap();
 
-        // Pop under a short-lived lock so no guard crosses an await point.
-        let msg = self.queue.lock().pop();
-
-        if let Some(msg) = msg {
+        // Now see if there are any messages
+        if let Some(msg) = self.queue.lock().await.pop() {
             // We have a message, process it in a separate task.
-            // The permit is moved into the task so it is held for the full
-            // duration of process_message, enforcing MAX_IN_FLIGHT_TRANSACTIONS.
             let sender = self.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(Error::ChainError(chain::Error::Rpc(ErrorResp(e)))) = sender.process_message(msg).await {
-                    if e.code == TX_FAILURE_INSUFFICIENT_FUNDS {
-                        error!("Insufficient funds to send transaction; dropping message");
+                if let Err(e) = sender.process_message(msg).await {
+                    match &e {
+                        Error::ChainError(chain_err) => {
+                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err {
+                                if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS {
+                                    error!(
+                                        "Insufficient funds to send transaction; dropping message"
+                                    );
+                                    return;
+                                }
+                            }
+                            error!("Error processing message: {:?}", e);
+                        }
+                        _ => {
+                            error!("Error processing message: {:?}", e);
+                        }
                     }
                 }
             });
@@ -172,234 +161,167 @@ impl Sender {
         }
     }
 
-    /// Validates and sends a single message, binding its nonce and gas prices
+    /// Validates and sends a single message, binding its replay token and fees
     /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
+        debug!("processing message {:?} {}", msg.to, msg.value);
+
         let now_ms = SystemClock.now_ms();
 
-        // First ensure the message is still valid
         if msg.is_expired(now_ms) {
             return Err(Error::MessageExpired);
         }
 
-        // Get the next unscheduled nonce and initial gas prices
-        let nonce = self.nonce_manager.get_next_available_nonce();
-        let (base_fee, priority_fee) = self.gas_manager.get_gas_price(msg.effective_priority(now_ms))?;
+        // Late-bind replay token (nonce / blockhash) and fees
+        let replay_token = self.replay.next().await;
+        let fee = match self
+            .fees
+            .get_fee_params(msg.effective_priority(now_ms))
+            .await
+        {
+            Ok(fee) => fee,
+            Err(err) => {
+                self.replay.release(&replay_token).await;
+                return Err(err);
+            }
+        };
 
-        // Send transaction
-        self.send_transaction(msg, nonce, base_fee, priority_fee, 0)
-            .await?;
-        Ok(())
+        // Send the transaction
+        self.send_and_watch(msg, fee, replay_token, 0).await
     }
 
-    /// Builds, signs, and broadcasts a transaction, then watches for confirmation.
-    ///
-    /// On confirmation, this method updates the nonce and gas-price trackers.
-    /// On timeout or drop, it delegates to [`handle_transaction_dropped`] which
-    /// may bump the fee and retry up to [`MAX_REPLACEMENTS`] times.
-    ///
-    /// [`handle_transaction_dropped`]: Self::handle_transaction_dropped
-    fn send_transaction(
+    /// Sends a transaction and watches for confirmation, handling retries on drop.
+    async fn send_and_watch(
         &self,
-        msg: Message,
-        nonce: u64,
-        base_fee: u128,
-        priority_fee: u128,
-        replacement_count: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
-        Box::pin(async move {
+        mut msg: Message,
+        mut fee: A::FeeParams,
+        mut replay_token: A::ReplayToken,
+        mut replacement_count: u32,
+    ) -> Result<(), Error> {
+        loop {
             let now_ms = SystemClock.now_ms();
-
             // Ensure the message is still valid
             if msg.is_expired(now_ms) {
-                self.nonce_manager.mark_nonce_available(nonce);
+                self.replay.release(&replay_token).await;
                 return Err(Error::MessageExpired);
             }
 
-            // Ensure we haven't exceeded the maximum number of replacements
-            if replacement_count > MAX_REPLACEMENTS {
-                self.nonce_manager.mark_nonce_available(nonce);
-                return Err(Error::FeeIncreasesExceeded);
-            }
+            let created_at = Instant::now();
 
-            // Build the transaction
-            let tx = TxEip1559 {
-                chain_id: self.chain.id(),
-
-                // Message fields
-                to: msg.to.map_or(TxKind::Create, TxKind::Call),
-                value: msg.value,
-                input: msg.data.clone(),
-
-                // Transaction wrapper fields
-                nonce,
-                gas_limit: msg.gas,
-                max_fee_per_gas: base_fee + priority_fee,
-                max_priority_fee_per_gas: priority_fee,
-
-                access_list: Default::default(),
-            };
-
-            // Send the transaction and get a watcher
-            // If this fails, mark the nonce as available and return the error
-            let watcher = match self.chain.send_transaction(tx).await {
-                Ok(w) => w,
-                Err(e) => {
-                    self.nonce_manager.mark_nonce_available(nonce);
-                    return Err(Error::ChainError(e));
+            // Send the transaction via the chain client.
+            // Returns a SendOutcome indicating confirmation, drop, or revert.
+            let outcome = match self
+                .client
+                .send_transaction(&msg, &fee, &replay_token)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.replay.release(&replay_token).await;
+                    return Err(err);
                 }
             };
 
-            let tx_hash = *watcher.tx_hash();
-            info!("sent transaction {:?} nonce={}", tx_hash, nonce);
-
-            // Track the pending transaction
-            self.pending.lock().insert(tx_hash, PendingTransaction {
-                msg,
-                nonce,
-                priority_fee,
-                replacement_count,
-                created_at: Instant::now(),
-            });
-
-            // Watch the pending transaction for confirmation or timeout
-            match self.watch_transaction(watcher).await {
-                Ok(_) => {
-                    match self.chain.get_receipt(tx_hash).await {
-                        // We got a receipt
-                        Ok(Some(receipt)) => self.handle_transaction_receipt(tx_hash, receipt).await,
-
-                        // We timed out
-                        Ok(None) => self.handle_transaction_dropped(tx_hash).await,
-
-                        // Error getting the receipt
-                        Err(e) => {
-                            error!("error getting receipt for {:?}: {}", tx_hash, e);
-                            self.handle_transaction_dropped(tx_hash).await
-                        }
+            match outcome {
+                SendOutcome::Confirmed { tx_id } => {
+                    // Transaction confirmed — update trackers
+                    let pending = PendingTransaction {
+                        msg,
+                        tx_id,
+                        fee,
+                        replay_token,
+                        created_at,
+                        replacement_count,
                     };
+                    let confirmation_time = pending.created_at.elapsed();
+                    self.retry
+                        .handle_confirmed(&pending, &self.fees, &self.replay, confirmation_time)
+                        .await;
+                    return Ok(());
                 }
-                // Transaction dropped
-                Err(e) => {
-                    error!("watcher error for {:?}: {}", tx_hash, e);
-                    self.handle_transaction_dropped(tx_hash).await
-                }
-            };
-            Ok(())
-        })
-    }
+                SendOutcome::Dropped { tx_id } | SendOutcome::Reverted { tx_id } => {
+                    // Transaction was dropped/timed out or reverted — delegate to retry
+                    let pending = PendingTransaction {
+                        msg: msg.clone(),
+                        tx_id: tx_id.clone(),
+                        fee: fee.clone(),
+                        replay_token: replay_token.clone(),
+                        created_at,
+                        replacement_count,
+                    };
 
-    /// Registers a confirmation watcher with a [`TX_TIMEOUT`]-second deadline.
-    async fn watch_transaction(&self, watcher: PendingTransactionBuilder<Ethereum>) -> Result<TxHash, Error> {
-        let pending = watcher
-            .with_required_confirmations(1)
-            .with_timeout(Some(Duration::from_secs(TX_TIMEOUT)))
-            .register().await?;
-        Ok(pending.await?)
-    }
+                    if !msg.increment_retry() {
+                        self.replay.release(&pending.replay_token).await;
+                        error!(
+                            "Message for transaction {:?} failed after max retries",
+                            tx_id
+                        );
+                        return Ok(());
+                    }
 
-    /// Handles a confirmed transaction - updates the gas and nonce trackers.
-    ///
-    /// If the receipt indicates a revert, this method delegates to
-    /// [`handle_transaction_dropped`] for retry handling.
-    ///
-    /// [`handle_transaction_dropped`]: Self::handle_transaction_dropped
-    async fn handle_transaction_receipt(
-        &self,
-        tx_hash: B256,
-        receipt: TransactionReceipt,
-    ) {
-        // Handle reverts
-        if !receipt.status() {
-            self.handle_transaction_dropped(tx_hash).await;
-            return;
-        }
-
-        // Transaction confirmed; remove it from pending and update the gas and nonce trackers
-        info!("transaction {:?} confirmed", tx_hash);
-        if let Some(pending_tx) = self.pending.lock().remove(&tx_hash) {
-            let latency = pending_tx.created_at.elapsed();
-            self.gas_manager.update_on_confirmation(latency, receipt.effective_gas_price);
-            self.nonce_manager.update_current_nonce(pending_tx.nonce);
-        }
-    }
-
-    /// Handles a dropped or timed-out transaction.
-    ///
-    /// If the message has retries remaining, this method attempts to replace
-    /// the transaction with a higher priority fee via [`bump_transaction_fee`].
-    /// If retries are exhausted, the message is abandoned and logged.
-    ///
-    /// [`bump_transaction_fee`]: Self::bump_transaction_fee
-    async fn handle_transaction_dropped(&self, tx_hash: B256) {
-        let mut pending_tx = {
-            let mut pending = self.pending.lock();
-            match pending.remove(&tx_hash) {
-                Some(tx) => tx,
-                None => {
-                    warn!("transaction {} not found in pending map", tx_hash);
-                    return;
+                    match self
+                        .retry
+                        .handle_dropped(&pending, &self.client, &self.fees, &self.replay)
+                        .await
+                    {
+                        RetryDecision::Resubmit {
+                            fee: new_fee,
+                            replay_token: new_replay,
+                        } => {
+                            fee = new_fee;
+                            replay_token = new_replay;
+                            replacement_count = pending.replacement_count + 1;
+                            continue;
+                        }
+                        RetryDecision::Requeue => {
+                            self.replay.release(&pending.replay_token).await;
+                            // Re-queue the message; it will get fresh fee params and replay
+                            // token when it is next popped from the priority queue.
+                            self.add_message(msg).await;
+                            return Ok(());
+                        }
+                        RetryDecision::Abandon => {
+                            self.replay.release(&pending.replay_token).await;
+                            error!("Abandoning transaction {:?}", tx_id);
+                            return Ok(());
+                        }
+                    }
                 }
             }
-        }; // lock released here, before any await
-
-        // If we have retries left then attempt to bump the fee
-        if pending_tx.msg.increment_retry() {
-            if let Err(e) = self.bump_transaction_fee(tx_hash, pending_tx).await {
-                error!("failed to replace transaction {:?}: {:?}", tx_hash, e);
-            }
-            return;
         }
-
-        error!("message for transaction {:?} failed after max retries", tx_hash);
     }
-
-    /// Re-sends a dropped transaction at the same nonce with a
-    /// [`GAS_PRICE_INCREASE_PERCENT`]% higher priority fee.
-    async fn bump_transaction_fee(
-        &self,
-        tx_hash: B256,
-        pending_tx: PendingTransaction,
-    ) -> Result<(), Error> {
-        let base_fee = self.gas_manager.get_base_fee();
-        let new_priority = bump_by_percent(pending_tx.priority_fee, GAS_PRICE_INCREASE_PERCENT);
-
-        info!("replacing {:?} with priority_fee={}", tx_hash, new_priority);
-
-        self.send_transaction(
-            pending_tx.msg,
-            pending_tx.nonce,
-            base_fee,
-            new_priority,
-            pending_tx.replacement_count + 1,
-        )
-        .await
-    }
-}
-
-fn bump_by_percent(n: u128, percent: u8) -> u128 {
-    n + n * percent as u128 / 100
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bump_by_percent, Sender};
+    use super::Sender;
+    use crate::adapter::ethereum::{
+        bump_by_percent, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy,
+    };
     use crate::{chain, Message};
     use alloy::primitives::Address;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    // A minimal mock that satisfies NonceManager::new inside Sender::new.
+    // A minimal mock that satisfies NonceManager::new inside EthReplayProtection::new.
     fn base_mock() -> chain::MockChainClient {
         let mut mock = chain::MockChainClient::new();
-        mock.expect_get_account_nonce()
-            .returning(|_| Ok(0u64));
+        mock.expect_get_account_nonce().returning(|_| Ok(0u64));
         mock
     }
 
-    async fn make_sender(mock: chain::MockChainClient) -> Sender {
-        Sender::new(Arc::new(mock), Address::default()).await.unwrap()
+    async fn make_sender(mock: chain::MockChainClient) -> Sender<Eth> {
+        let chain = Arc::new(mock);
+        let client = Arc::new(EthClient::new(chain.clone()));
+        let fees = Arc::new(EthFeeManager::new());
+        let replay = Arc::new(
+            EthReplayProtection::new(chain.clone(), Address::default())
+                .await
+                .unwrap(),
+        );
+        let retry = Arc::new(EthRetryStrategy::new());
+        Sender::new(client, fees, replay, retry)
     }
 
     // ── bump_by_percent ──────────────────────────────────────────────────────
@@ -432,23 +354,23 @@ mod tests {
     #[tokio::test]
     async fn test_new_has_empty_queue() {
         let sender = make_sender(base_mock()).await;
-        assert_eq!(sender.queue.lock().len(), 0);
+        assert_eq!(sender.queue.lock().await.len(), 0);
     }
 
     #[tokio::test]
     async fn test_add_message_enqueues() {
         let sender = make_sender(base_mock()).await;
-        sender.add_message(Message::default());
-        assert_eq!(sender.queue.lock().len(), 1);
+        sender.add_message(Message::default()).await;
+        assert_eq!(sender.queue.lock().await.len(), 1);
     }
 
     #[tokio::test]
     async fn test_add_multiple_messages() {
         let sender = make_sender(base_mock()).await;
         for _ in 0..4 {
-            sender.add_message(Message::default());
+            sender.add_message(Message::default()).await;
         }
-        assert_eq!(sender.queue.lock().len(), 4);
+        assert_eq!(sender.queue.lock().await.len(), 4);
     }
 
     // ── run() ────────────────────────────────────────────────────────────────
@@ -456,6 +378,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_errors_when_block_stream_closes() {
         let mut mock = base_mock();
+        // subscribe_new_blocks needs to be mocked on the inner chain client
+        // but our EthClient wraps it. We need to set up the mock to handle
+        // subscribe_new_blocks returning a stream that closes immediately.
         mock.expect_subscribe_new_blocks().returning(|| {
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
@@ -463,7 +388,10 @@ mod tests {
 
         let sender = make_sender(mock).await;
         let result = sender.run().await;
-        assert!(result.is_err(), "run() must return Err when the block stream closes");
+        assert!(
+            result.is_err(),
+            "run() must return Err when the block stream closes"
+        );
     }
 
     // ── process_next_message() ───────────────────────────────────────────────
@@ -488,20 +416,19 @@ mod tests {
     async fn test_process_next_message_pops_and_attempts_send() {
         let mut mock = base_mock();
         mock.expect_id().returning(|| 1337u64);
-        mock.expect_send_transaction().returning(|_| {
-            Err(chain::Error::Subscription("injected".into()))
-        });
+        mock.expect_send_transaction()
+            .returning(|_| Err(chain::Error::Subscription("injected".into())));
 
         let sender = make_sender(mock).await;
         let mut msg = Message::default();
         msg.to = Some(Address::default());
         msg.gas = 21_000;
-        sender.add_message(msg);
-        assert_eq!(sender.queue.lock().len(), 1);
+        sender.add_message(msg).await;
+        assert_eq!(sender.queue.lock().await.len(), 1);
 
         sender.process_next_message().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        assert_eq!(sender.queue.lock().len(), 0);
+        assert_eq!(sender.queue.lock().await.len(), 0);
     }
 }
