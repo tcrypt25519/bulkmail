@@ -2,8 +2,7 @@
 
 use crate::{chain::ChainClient, Error};
 use alloy::primitives::Address;
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::Mutex;
 
 /// Nonce tracking state guarded by a single [`Mutex`].

@@ -12,8 +12,7 @@ pub mod ethereum;
 
 use crate::Error;
 use async_trait::async_trait;
-use std::fmt::Debug;
-use std::time::Duration;
+use std::{fmt::Debug, time::Duration};
 use tokio::sync::mpsc;
 
 /// A channel receiver that yields new block/slot notifications.

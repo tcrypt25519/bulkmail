@@ -4,8 +4,7 @@
 
 use alloy::primitives::{Address, Bytes, U256};
 use chrono::{DateTime, Utc};
-use std::fmt::Display;
-use std::time::Instant;
+use std::{fmt::Display, time::Instant};
 
 pub(crate) const MAX_PRIORITY: u32 = 100;
 const BLOCK_TIME: u32 = 2;
