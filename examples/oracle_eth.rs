@@ -3,7 +3,7 @@ use alloy_node_bindings::Anvil;
 use bulkmail::{
     Chain, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, Message, Sender,
 };
-use log::{error, info, LevelFilter};
+use log::{LevelFilter, error, info};
 use simple_logger::SimpleLogger;
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
@@ -11,6 +11,8 @@ use tokio::time::sleep;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("hex decoding error: {0}")]
+    HexDecode(#[from] hex::FromHexError),
     #[error("transaction manager error: {0}")]
     TM(#[from] bulkmail::Error),
     #[error("chain error: {0}")]

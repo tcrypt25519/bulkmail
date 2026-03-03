@@ -137,15 +137,12 @@ impl<A: ChainAdapter> Sender<A> {
                 let _permit = permit;
                 if let Err(e) = sender.process_message(msg).await {
                     match &e {
-                        Error::ChainError(chain_err) => {
-                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err {
-                                if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS {
-                                    error!(
-                                        "Insufficient funds to send transaction; dropping message"
-                                    );
-                                    return;
-                                }
-                            }
+                        Error::ChainError(crate::chain::Error::Rpc(ErrorResp(resp)))
+                            if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS =>
+                        {
+                            error!("Insufficient funds to send transaction; dropping message");
+                        }
+                        Error::ChainError(_) => {
                             error!("Error processing message: {:?}", e);
                         }
                         _ => {
@@ -296,9 +293,9 @@ impl<A: ChainAdapter> Sender<A> {
 mod tests {
     use super::Sender;
     use crate::adapter::ethereum::{
-        bump_by_percent, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy,
+        Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
     };
-    use crate::{chain, Message};
+    use crate::{Message, chain};
     use alloy::primitives::Address;
     use std::sync::Arc;
     use std::time::Duration;
