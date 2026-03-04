@@ -10,7 +10,11 @@ license = "MIT OR Apache-2.0"
 # Default to Ethereum until Solana support is implemented.
 default = ["ethereum"]
 ethereum = []
-solana = ["dep:solana-sdk", "dep:solana-client", "dep:solana-transaction-status"]
+solana = [
+    "dep:solana-sdk",
+    "dep:solana-client",
+    "dep:solana-transaction-status",
+]
 # Opt-in structured logging via the tracing ecosystem.
 tracing = ["dep:tracing"]
 
@@ -35,7 +39,7 @@ alloy = { version = "1.7.3", default-features = false, features = [
 ] }
 alloy-node-bindings = "1.7.3"
 simple_logger = "5.2.0"
-solana-sdk = { version = "2.2", optional = true, default-features = false }
+solana-sdk = { version = "2.2", optional = true, default-features = false, features = ["full"] }
 solana-client = { version = "2.2", optional = true, default-features = false }
 solana-transaction-status = { version = "2.2", optional = true, default-features = false }
 

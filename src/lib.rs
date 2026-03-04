@@ -115,4 +115,8 @@ pub enum Error {
     /// A subscription was closed unexpectedly.
     #[error("subscription closed")]
     SubscriptionClosed,
+
+    /// An error originating from Solana RPC or Pubsub operations.
+    #[error("solana error: {0}")]
+    SolanaError(String),
 }

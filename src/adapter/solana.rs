@@ -11,10 +11,14 @@ use crate::adapter::{
 };
 use crate::Error;
 use async_trait::async_trait;
-use solana_client::{pubsub_client::PubsubClient, rpc_client::RpcClient};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient,
+    pubsub_client::PubsubClient,
+};
 use solana_sdk::{
     hash::Hash, instruction::Instruction, signature::Signature, transaction::VersionedTransaction,
 };
+use solana_transaction_status::TransactionConfirmationStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,27 +46,47 @@ impl ChainAdapter for Sol {
 
 /// Solana chain client (RPC + Pubsub).
 pub struct SolClient {
-    #[allow(dead_code)]
     rpc: Arc<RpcClient>,
-    #[allow(dead_code)]
-    pubsub: Arc<PubsubClient>,
+    pubsub_url: String,
 }
 
 impl SolClient {
     #[allow(dead_code)]
-    pub fn new(rpc: Arc<RpcClient>, pubsub: Arc<PubsubClient>) -> Self {
-        Self { rpc, pubsub }
+    pub fn new(rpc: Arc<RpcClient>, pubsub_url: impl Into<String>) -> Self {
+        Self {
+            rpc,
+            pubsub_url: pubsub_url.into(),
+        }
     }
 }
 
 #[async_trait]
 impl ChainClient<Sol> for SolClient {
     async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error> {
-        todo!("Implement slot subscription via PubsubClient");
+        let (subscription, receiver) =
+            PubsubClient::slot_subscribe(&self.pubsub_url).map_err(|err| {
+                Error::SolanaError(format!("slot_subscribe failed: {err}"))
+            })?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        std::thread::spawn(move || {
+            // Keep the subscription alive for the lifetime of this thread.
+            let _subscription = subscription;
+            for slot_info in receiver.iter() {
+                if tx.blocking_send(slot_info.slot).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     async fn get_block_number(&self) -> Result<u64, Error> {
-        todo!("Implement get_latest_blockhash / block height via RpcClient");
+        self.rpc
+            .get_slot()
+            .await
+            .map_err(|err| Error::SolanaError(format!("get_slot failed: {err}")))
     }
 
     async fn send_transaction(
@@ -71,11 +95,43 @@ impl ChainClient<Sol> for SolClient {
         _fee: &SolFeeParams,
         _replay_token: &Hash,
     ) -> Result<SendOutcome<Sol>, Error> {
-        todo!("Implement send + confirm using VersionedTransaction");
+        Err(Error::SolanaError(
+            "send_transaction not implemented for Solana yet".to_string(),
+        ))
     }
 
     async fn get_transaction_status(&self, _id: &Signature) -> Result<TransactionStatus, Error> {
-        todo!("Implement signature status lookup");
+        let status = self
+            .rpc
+            .get_signature_statuses(&[*_id])
+            .await
+            .map_err(|err| Error::SolanaError(format!("get_signature_statuses failed: {err}")))?
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+
+        let status = match status {
+            None => return Ok(TransactionStatus::Pending),
+            Some(status) => status,
+        };
+
+        if let Some(err) = status.err {
+            return Ok(TransactionStatus::Failed {
+                reason: format!("{err:?}"),
+            });
+        }
+
+        match status.confirmation_status() {
+            TransactionConfirmationStatus::Finalized => Ok(TransactionStatus::Finalized {
+                number: status.slot,
+            }),
+            TransactionConfirmationStatus::Confirmed | TransactionConfirmationStatus::Processed => {
+                Ok(TransactionStatus::Confirmed {
+                    number: status.slot,
+                })
+            }
+        }
     }
 }
 
