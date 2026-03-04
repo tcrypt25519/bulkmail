@@ -57,10 +57,8 @@ impl PriorityQueue {
 
     /// Pushes `message` onto the queue, capturing its effective priority at
     /// insertion time.
-    ///
-    /// `now_ms` must be the current Unix epoch time in milliseconds.
-    pub fn push(&mut self, message: Message, now_ms: u64) {
-        let effective_priority = message.effective_priority(now_ms);
+    pub fn push(&mut self, message: Message) {
+        let effective_priority = message.effective_priority();
         self.heap.push(PrioritizedMessage {
             message,
             effective_priority,
@@ -97,27 +95,29 @@ mod tests {
     use crate::{Error, Message};
     use alloy::primitives::Address;
 
-    const NOW_MS: u64 = 1_000_000; // arbitrary fixed "now" for tests
-
     #[test]
-    fn test_priority_queue_pops_in_priority_order() -> Result<(), Error> {
+    fn test_priority_queue() -> Result<(), Error> {
         let mut queue = PriorityQueue::new();
-        for priority in [0u32, 1, 2] {
-            let msg = Message::new(
-                Some(Address::default()),
-                21_000,
-                Default::default(),
-                Default::default(),
-                priority,
-                None,
-                NOW_MS,
-            );
-            queue.push(msg, NOW_MS);
-        }
+
+        let mut msg1 = Message::default();
+        msg1.to = Some(Address::default());
+
+        let mut msg2 = Message::default();
+        msg2.to = Some(Address::default());
+        msg2.priority = 1;
+
+        let mut msg3 = Message::default();
+        msg3.to = Some(Address::default());
+        msg3.priority = 2;
+
+        queue.push(msg1);
+        queue.push(msg2);
+        queue.push(msg3);
 
         assert_eq!(queue.len(), 3);
         assert!(!queue.is_empty());
 
+        // Messages should come out in order of priority
         assert_eq!(queue.pop().unwrap().priority, 2);
         assert_eq!(queue.pop().unwrap().priority, 1);
         assert_eq!(queue.pop().unwrap().priority, 0);
@@ -128,29 +128,17 @@ mod tests {
 
     #[test]
     fn test_prioritized_message_ordering() -> Result<(), Error> {
-        let msg1 = Message::new(
-            None,
-            0,
-            Default::default(),
-            Default::default(),
-            1,
-            None,
-            NOW_MS,
-        );
-        let msg2 = Message::new(
-            None,
-            0,
-            Default::default(),
-            Default::default(),
-            2,
-            None,
-            NOW_MS,
-        );
+        let mut msg1 = Message::default();
+        msg1.priority = 1;
+
+        let mut msg2 = Message::default();
+        msg2.priority = 2;
 
         let pm1 = PrioritizedMessage {
             message: msg1,
             effective_priority: 1,
         };
+
         let pm2 = PrioritizedMessage {
             message: msg2,
             effective_priority: 2,

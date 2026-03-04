@@ -150,13 +150,7 @@ impl ChainClient<Eth> for EthClient {
             Ok(Some(receipt)) => {
                 if receipt.status() {
                     Ok(TransactionStatus::Confirmed {
-                        number: receipt.block_number.unwrap_or_else(|| {
-                            warn!(
-                                "Receipt for transaction {:?} missing block number; defaulting to 0",
-                                tx_hash
-                            );
-                            0
-                        }),
+                        number: receipt.block_number.unwrap_or(0),
                     })
                 } else {
                     Ok(TransactionStatus::Failed {
@@ -194,7 +188,7 @@ impl Default for EthFeeManager {
 #[async_trait]
 impl FeeManager<Eth> for EthFeeManager {
     async fn get_fee_params(&self, priority: u32) -> Result<EthFeeParams, Error> {
-        let (base_fee, priority_fee) = self.inner.get_gas_price(priority)?;
+        let (base_fee, priority_fee) = self.inner.get_gas_price(priority).await?;
         Ok(EthFeeParams {
             base_fee,
             priority_fee,
@@ -203,7 +197,8 @@ impl FeeManager<Eth> for EthFeeManager {
 
     async fn update_on_confirmation(&self, confirmation_time: Duration, fee_paid: &EthFeeParams) {
         self.inner
-            .update_on_confirmation(confirmation_time, fee_paid.priority_fee);
+            .update_on_confirmation(confirmation_time, fee_paid.priority_fee)
+            .await;
     }
 
     fn bump_fee(&self, current: &EthFeeParams) -> EthFeeParams {
@@ -214,7 +209,7 @@ impl FeeManager<Eth> for EthFeeManager {
     }
 
     async fn get_base_fee(&self) -> EthFeeParams {
-        let base_fee = self.inner.get_base_fee();
+        let base_fee = self.inner.get_base_fee().await;
         EthFeeParams {
             base_fee,
             priority_fee: 0,
@@ -242,7 +237,7 @@ impl EthReplayProtection {
     /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
     /// when a transaction fails before broadcast.
     pub async fn release_nonce(&self, nonce: u64) {
-        self.inner.mark_nonce_available(nonce);
+        self.inner.mark_nonce_available(nonce).await;
     }
 
     /// Advances the confirmed nonce baseline.
@@ -251,22 +246,18 @@ impl EthReplayProtection {
     /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
     /// on transaction confirmation.
     pub async fn confirm_nonce(&self, nonce: u64) {
-        self.inner.update_current_nonce(nonce);
+        self.inner.update_current_nonce(nonce).await;
     }
 }
 
 #[async_trait]
 impl ReplayProtection<Eth> for EthReplayProtection {
     async fn next(&self) -> u64 {
-        self.inner.get_next_available_nonce()
+        self.inner.get_next_available_nonce().await
     }
 
     async fn sync(&self) -> Result<(), Error> {
         self.inner.sync_nonce().await
-    }
-
-    async fn release(&self, token: &u64) {
-        self.inner.mark_nonce_available(*token);
     }
 }
 
