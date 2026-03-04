@@ -1,15 +1,19 @@
 use async_trait::async_trait;
-use bulkmail::adapter::{
-    BlockReceiver, ChainAdapter, ChainClient, FeeManager, ReplayProtection, RetryDecision,
-    RetryStrategy, SendOutcome, TransactionStatus,
+use bulkmail::{
+    Error, Message, Sender,
+    adapter::{
+        BlockReceiver, ChainAdapter, ChainClient, FeeManager, ReplayProtection, RetryDecision,
+        RetryStrategy, SendOutcome, TransactionStatus,
+    },
 };
-use bulkmail::{Error, Message, Sender};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::{
+    sync::mpsc,
+    time::{Duration, timeout},
+};
 
 // -----------------------------------------------------------------------------
 // Adapter: Happy path
