@@ -380,3 +380,180 @@ async fn solana_resubmit_uses_fresh_replay_token() {
     assert_eq!(seen.len(), 2);
     assert_ne!(seen[0], seen[1], "resubmission should use new replay token");
 }
+
+// -----------------------------------------------------------------------------
+// Adapter: Solana requeue releases replay token and re-enqueues
+// -----------------------------------------------------------------------------
+#[derive(Debug)]
+struct SolAdapterRequeue;
+
+#[derive(Debug, Clone)]
+struct SolClientRequeue {
+    receiver: Arc<Mutex<Option<BlockReceiver>>>,
+    attempts: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ChainClient<SolAdapterRequeue> for SolClientRequeue {
+    async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error> {
+        self.receiver
+            .lock()
+            .expect("receiver lock poisoned")
+            .take()
+            .ok_or(Error::SubscriptionClosed)
+    }
+
+    async fn get_block_number(&self) -> Result<u64, Error> {
+        Ok(0)
+    }
+
+    async fn send_transaction(
+        &self,
+        _msg: &Message,
+        _fee: &u64,
+        _replay_token: &Hash,
+    ) -> Result<SendOutcome<SolAdapterRequeue>, Error> {
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt == 0 {
+            Ok(SendOutcome::Dropped {
+                tx_id: Signature::default(),
+            })
+        } else {
+            Ok(SendOutcome::Confirmed {
+                tx_id: Signature::default(),
+            })
+        }
+    }
+
+    async fn get_transaction_status(
+        &self,
+        _id: &Signature,
+    ) -> Result<TransactionStatus, Error> {
+        Ok(TransactionStatus::Confirmed { number: 1 })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SolFeeRequeue;
+
+#[async_trait]
+impl FeeManager<SolAdapterRequeue> for SolFeeRequeue {
+    async fn get_fee_params(&self, _priority: u32) -> Result<u64, Error> {
+        Ok(1)
+    }
+
+    async fn update_on_confirmation(&self, _confirmation_time: Duration, _fee_paid: &u64) {}
+
+    fn bump_fee(&self, current: &u64) -> u64 {
+        current.saturating_add(1)
+    }
+
+    async fn get_base_fee(&self) -> u64 {
+        1
+    }
+}
+
+#[derive(Debug, Default)]
+struct SolReplayRequeue {
+    released: AtomicBool,
+}
+
+#[async_trait]
+impl ReplayProtection<SolAdapterRequeue> for SolReplayRequeue {
+    async fn next(&self) -> Hash {
+        Hash::new_unique()
+    }
+
+    async fn sync(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn release(&self, _token: &Hash) {
+        self.released.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct SolRetryRequeue {
+    called: AtomicBool,
+}
+
+#[async_trait]
+impl RetryStrategy<SolAdapterRequeue> for SolRetryRequeue {
+    async fn handle_dropped(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<SolAdapterRequeue>,
+        _client: &SolClientRequeue,
+        _fees: &SolFeeRequeue,
+        _replay: &SolReplayRequeue,
+    ) -> RetryDecision<SolAdapterRequeue> {
+        if self.called.swap(true, Ordering::Relaxed) {
+            RetryDecision::Abandon
+        } else {
+            RetryDecision::Requeue
+        }
+    }
+
+    async fn handle_confirmed(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<SolAdapterRequeue>,
+        _fees: &SolFeeRequeue,
+        _replay: &SolReplayRequeue,
+        _confirmation_time: Duration,
+    ) {
+    }
+}
+
+impl ChainAdapter for SolAdapterRequeue {
+    type FeeParams = u64;
+    type ReplayToken = Hash;
+    type TxId = Signature;
+    type Client = SolClientRequeue;
+    type FeeManager = SolFeeRequeue;
+    type ReplayProtection = SolReplayRequeue;
+    type RetryStrategy = SolRetryRequeue;
+}
+
+#[tokio::test]
+async fn solana_requeue_releases_token() {
+    let (tx, rx) = mpsc::channel::<u64>(1);
+    let replay = Arc::new(SolReplayRequeue::default());
+
+    let sender = Sender::<SolAdapterRequeue>::new(
+        Arc::new(SolClientRequeue {
+            receiver: Arc::new(Mutex::new(Some(rx))),
+            attempts: Arc::new(AtomicU64::new(0)),
+        }),
+        Arc::new(SolFeeRequeue),
+        replay.clone(),
+        Arc::new(SolRetryRequeue {
+            called: AtomicBool::new(false),
+        }),
+    );
+
+    let instruction = Instruction {
+        program_id: Pubkey::new_unique(),
+        accounts: Vec::new(),
+        data: vec![9],
+    };
+
+    sender
+        .add_message(Message::solana(vec![instruction], 1, None, 0))
+        .await;
+
+    let run_sender = sender.clone();
+    let run_handle = tokio::spawn(async move { run_sender.run().await });
+
+    tx.send(1).await.expect("block send failed");
+
+    timeout(Duration::from_secs(2), async {
+        while !replay.released.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replay token not released on requeue");
+
+    drop(tx);
+    run_handle.abort();
+}
