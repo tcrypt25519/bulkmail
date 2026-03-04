@@ -132,11 +132,6 @@ pub trait ReplayProtection<A: ChainAdapter>: Send + Sync {
     /// Sync with the chain (called on each new block/slot notification).
     /// This is where RPC calls to refresh state happen.
     async fn sync(&self) -> Result<(), Error>;
-
-    /// Release a replay-protection token if a transaction fails before broadcast.
-    ///
-    /// Default implementation is a no-op for chains that do not require it.
-    async fn release(&self, _token: &A::ReplayToken) {}
 }
 
 /// Chain-agnostic retry / fee-bump strategy.
