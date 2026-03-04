@@ -5,23 +5,21 @@
 //!
 //! [`Sender<Sol>`]: crate::Sender
 
-use crate::adapter::{
-    BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
-    RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
+use crate::{
+    Error,
+    adapter::{
+        BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
+        RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
+    },
 };
-use crate::Error;
 use async_trait::async_trait;
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    pubsub_client::PubsubClient,
-};
+use solana_client::{nonblocking::rpc_client::RpcClient, pubsub_client::PubsubClient};
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    hash::Hash, instruction::Instruction, signature::Signature, transaction::VersionedTransaction,
+    commitment_config::CommitmentConfig, hash::Hash, instruction::Instruction,
+    signature::Signature, transaction::VersionedTransaction,
 };
 use solana_transaction_status::TransactionConfirmationStatus;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 /// Solana fee parameters (placeholder).
@@ -65,10 +63,8 @@ impl SolClient {
 #[async_trait]
 impl ChainClient<Sol> for SolClient {
     async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error> {
-        let (subscription, receiver) =
-            PubsubClient::slot_subscribe(&self.pubsub_url).map_err(|err| {
-                Error::SolanaError(format!("slot_subscribe failed: {err}"))
-            })?;
+        let (subscription, receiver) = PubsubClient::slot_subscribe(&self.pubsub_url)
+            .map_err(|err| Error::SolanaError(format!("slot_subscribe failed: {err}")))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         std::thread::spawn(move || {
@@ -217,9 +213,7 @@ impl ReplayProtection<Sol> for SolReplayProtection {
                 .rpc
                 .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
                 .await
-                .map_err(|err| {
-                    Error::SolanaError(format!("get_latest_blockhash failed: {err}"))
-                })?;
+                .map_err(|err| Error::SolanaError(format!("get_latest_blockhash failed: {err}")))?;
 
             let mut state = self.state.lock().await;
             state.hash = hash;
@@ -259,9 +253,6 @@ impl RetryStrategy<Sol> for SolRetryStrategy {
 // --- Solana payload helpers (placeholder) -----------------------------------
 
 #[allow(dead_code)]
-fn build_transaction(
-    _instructions: Vec<Instruction>,
-    _blockhash: Hash,
-) -> VersionedTransaction {
+fn build_transaction(_instructions: Vec<Instruction>, _blockhash: Hash) -> VersionedTransaction {
     todo!("Construct VersionedTransaction with payer + instructions");
 }
