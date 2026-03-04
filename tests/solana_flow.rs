@@ -11,7 +11,7 @@ use bulkmail::{
 use solana_sdk::{hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::Signature};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{
     sync::mpsc,
@@ -186,4 +186,200 @@ async fn sender_processes_solana_message() {
         .expect("sender task panicked");
 
     assert!(matches!(result, Err(Error::SubscriptionClosed)));
+}
+
+// -----------------------------------------------------------------------------
+// Adapter: Solana retry uses fresh replay token
+// -----------------------------------------------------------------------------
+#[derive(Debug)]
+struct SolAdapterRetry;
+
+#[derive(Debug, Clone)]
+struct SolClientRetry {
+    receiver: Arc<Mutex<Option<BlockReceiver>>>,
+    tokens: Arc<Mutex<Vec<Hash>>>,
+    attempts: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ChainClient<SolAdapterRetry> for SolClientRetry {
+    async fn subscribe_new_blocks(&self) -> Result<BlockReceiver, Error> {
+        self.receiver
+            .lock()
+            .expect("receiver lock poisoned")
+            .take()
+            .ok_or(Error::SubscriptionClosed)
+    }
+
+    async fn get_block_number(&self) -> Result<u64, Error> {
+        Ok(0)
+    }
+
+    async fn send_transaction(
+        &self,
+        _msg: &Message,
+        _fee: &u64,
+        replay_token: &Hash,
+    ) -> Result<SendOutcome<SolAdapterRetry>, Error> {
+        self.tokens
+            .lock()
+            .expect("tokens lock poisoned")
+            .push(*replay_token);
+
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt == 0 {
+            Ok(SendOutcome::Dropped {
+                tx_id: Signature::default(),
+            })
+        } else {
+            Ok(SendOutcome::Confirmed {
+                tx_id: Signature::default(),
+            })
+        }
+    }
+
+    async fn get_transaction_status(
+        &self,
+        _id: &Signature,
+    ) -> Result<TransactionStatus, Error> {
+        Ok(TransactionStatus::Confirmed { number: 1 })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SolFeeRetry;
+
+#[async_trait]
+impl FeeManager<SolAdapterRetry> for SolFeeRetry {
+    async fn get_fee_params(&self, _priority: u32) -> Result<u64, Error> {
+        Ok(1)
+    }
+
+    async fn update_on_confirmation(&self, _confirmation_time: Duration, _fee_paid: &u64) {}
+
+    fn bump_fee(&self, current: &u64) -> u64 {
+        current.saturating_add(1)
+    }
+
+    async fn get_base_fee(&self) -> u64 {
+        1
+    }
+}
+
+#[derive(Debug, Default)]
+struct SolReplayRetry {
+    next: AtomicU64,
+}
+
+#[async_trait]
+impl ReplayProtection<SolAdapterRetry> for SolReplayRetry {
+    async fn next(&self) -> Hash {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = [0u8; 32];
+        bytes[0] = index as u8;
+        Hash::new_from_array(bytes)
+    }
+
+    async fn sync(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SolRetryResubmit {
+    called: AtomicBool,
+}
+
+#[async_trait]
+impl RetryStrategy<SolAdapterRetry> for SolRetryResubmit {
+    async fn handle_dropped(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<SolAdapterRetry>,
+        _client: &SolClientRetry,
+        fees: &SolFeeRetry,
+        replay: &SolReplayRetry,
+    ) -> RetryDecision<SolAdapterRetry> {
+        if self.called.swap(true, Ordering::Relaxed) {
+            return RetryDecision::Abandon;
+        }
+
+        let new_fee = fees.bump_fee(&_pending.fee);
+        let new_replay = replay.next().await;
+        RetryDecision::Resubmit {
+            fee: new_fee,
+            replay_token: new_replay,
+        }
+    }
+
+    async fn handle_confirmed(
+        &self,
+        _pending: &bulkmail::adapter::PendingTransaction<SolAdapterRetry>,
+        _fees: &SolFeeRetry,
+        _replay: &SolReplayRetry,
+        _confirmation_time: Duration,
+    ) {
+    }
+}
+
+impl ChainAdapter for SolAdapterRetry {
+    type FeeParams = u64;
+    type ReplayToken = Hash;
+    type TxId = Signature;
+    type Client = SolClientRetry;
+    type FeeManager = SolFeeRetry;
+    type ReplayProtection = SolReplayRetry;
+    type RetryStrategy = SolRetryResubmit;
+}
+
+#[tokio::test]
+async fn solana_resubmit_uses_fresh_replay_token() {
+    let (tx, rx) = mpsc::channel::<u64>(1);
+    let tokens = Arc::new(Mutex::new(Vec::new()));
+
+    let sender = Sender::<SolAdapterRetry>::new(
+        Arc::new(SolClientRetry {
+            receiver: Arc::new(Mutex::new(Some(rx))),
+            tokens: tokens.clone(),
+            attempts: Arc::new(AtomicU64::new(0)),
+        }),
+        Arc::new(SolFeeRetry),
+        Arc::new(SolReplayRetry::default()),
+        Arc::new(SolRetryResubmit {
+            called: AtomicBool::new(false),
+        }),
+    );
+
+    let instruction = Instruction {
+        program_id: Pubkey::new_unique(),
+        accounts: Vec::new(),
+        data: vec![7],
+    };
+
+    sender
+        .add_message(Message::solana(vec![instruction], 1, None, 0))
+        .await;
+
+    let run_sender = sender.clone();
+    let run_handle = tokio::spawn(async move { run_sender.run().await });
+
+    tx.send(1).await.expect("block send failed");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let count = tokens.lock().expect("tokens lock poisoned").len();
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry did not resubmit");
+
+    drop(tx);
+    let _ = timeout(Duration::from_secs(2), run_handle).await;
+
+    let seen = tokens.lock().expect("tokens lock poisoned");
+    assert_eq!(seen.len(), 2);
+    assert_ne!(seen[0], seen[1], "resubmission should use new replay token");
 }
