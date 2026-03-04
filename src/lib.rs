@@ -33,6 +33,7 @@ use thiserror::Error;
 
 pub mod adapter;
 pub mod chain;
+pub(crate) mod clock;
 pub(crate) mod gas_price;
 pub mod message;
 pub(crate) mod nonce_manager;

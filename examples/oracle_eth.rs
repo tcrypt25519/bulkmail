@@ -3,7 +3,7 @@ use alloy_node_bindings::Anvil;
 use bulkmail::{
     Chain, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, Message, Sender,
 };
-use log::{error, info, LevelFilter};
+use log::{LevelFilter, error, info};
 use simple_logger::SimpleLogger;
 use std::sync::Arc;
 use std::time::Duration;

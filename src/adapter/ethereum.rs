@@ -7,11 +7,11 @@
 
 use crate::adapter::{
     BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
-    RetryDecision, RetryStrategy, TransactionStatus,
+    RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
 };
-use crate::{chain, Error, GasPriceManager, NonceManager};
+use crate::{Error, GasPriceManager, NonceManager, chain};
 use alloy::consensus::TxEip1559;
-use alloy::primitives::{Address, TxKind, B256};
+use alloy::primitives::{Address, B256, TxKind};
 use async_trait::async_trait;
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -89,7 +89,7 @@ impl ChainClient<Eth> for EthClient {
         msg: &crate::Message,
         fee: &EthFeeParams,
         nonce: &u64,
-    ) -> Result<B256, Error> {
+    ) -> Result<SendOutcome<Eth>, Error> {
         let tx = TxEip1559 {
             chain_id: self.inner.id(),
             to: msg.to.map_or(TxKind::Create, TxKind::Call),
@@ -117,24 +117,26 @@ impl ChainClient<Eth> for EthClient {
             Ok(_hash) => {
                 // Check receipt for status
                 match self.inner.get_receipt(tx_hash).await {
-                    Ok(Some(receipt)) if receipt.status() => Ok(tx_hash),
+                    Ok(Some(receipt)) if receipt.status() => {
+                        Ok(SendOutcome::Confirmed { tx_id: tx_hash })
+                    }
                     Ok(Some(_receipt)) => {
                         // Transaction reverted
-                        Err(Error::TransactionReverted(tx_hash))
+                        Ok(SendOutcome::Reverted { tx_id: tx_hash })
                     }
                     Ok(None) => {
                         // Timeout / no receipt
-                        Err(Error::TransactionDropped(tx_hash))
+                        Ok(SendOutcome::Dropped { tx_id: tx_hash })
                     }
                     Err(e) => {
                         error!("Error getting receipt for {:?}: {}", tx_hash, e);
-                        Err(Error::TransactionDropped(tx_hash))
+                        Ok(SendOutcome::Dropped { tx_id: tx_hash })
                     }
                 }
             }
             Err(_) => {
                 // Dropped / timed out
-                Err(Error::TransactionDropped(tx_hash))
+                Ok(SendOutcome::Dropped { tx_id: tx_hash })
             }
         }
     }
@@ -144,7 +146,13 @@ impl ChainClient<Eth> for EthClient {
             Ok(Some(receipt)) => {
                 if receipt.status() {
                     Ok(TransactionStatus::Confirmed {
-                        number: receipt.block_number.unwrap_or(0),
+                        number: receipt.block_number.unwrap_or_else(|| {
+                            warn!(
+                                "Receipt for transaction {:?} missing block number; defaulting to 0",
+                                tx_hash
+                            );
+                            0
+                        }),
                     })
                 } else {
                     Ok(TransactionStatus::Failed {
@@ -225,12 +233,20 @@ impl EthReplayProtection {
         })
     }
 
-    /// Ethereum-only: return a nonce to the available pool.
+    /// Returns a nonce to the available pool.
+    ///
+    /// This is an Ethereum-specific method not required by the
+    /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
+    /// when a transaction fails before broadcast.
     pub async fn release_nonce(&self, nonce: u64) {
         self.inner.mark_nonce_available(nonce).await;
     }
 
-    /// Ethereum-only: advance the confirmed nonce baseline.
+    /// Advances the confirmed nonce baseline.
+    ///
+    /// This is an Ethereum-specific method not required by the
+    /// [`ReplayProtection`] trait. It is called by [`EthRetryStrategy`]
+    /// on transaction confirmation.
     pub async fn confirm_nonce(&self, nonce: u64) {
         self.inner.update_current_nonce(nonce).await;
     }
@@ -244,6 +260,10 @@ impl ReplayProtection<Eth> for EthReplayProtection {
 
     async fn sync(&self) -> Result<(), Error> {
         self.inner.sync_nonce().await
+    }
+
+    async fn release(&self, token: &u64) {
+        self.inner.mark_nonce_available(*token).await;
     }
 }
 
