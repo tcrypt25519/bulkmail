@@ -5,17 +5,21 @@
 //!
 //! [`Sender<Eth>`]: crate::Sender
 
-use crate::adapter::{
-    BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
-    RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
+use crate::{
+    Error, GasPriceManager, NonceManager,
+    adapter::{
+        BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
+        RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
+    },
+    chain,
 };
-use crate::{Error, GasPriceManager, NonceManager, chain};
-use alloy::consensus::TxEip1559;
-use alloy::primitives::{Address, B256, TxKind};
+use alloy::{
+    consensus::TxEip1559,
+    primitives::{Address, B256, TxKind},
+};
 use async_trait::async_trait;
 use log::{error, info, warn};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 /// Maximum number of times a stuck transaction may be replaced with a higher fee.
 const MAX_REPLACEMENTS: u32 = 3;
