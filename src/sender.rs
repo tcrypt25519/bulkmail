@@ -1,16 +1,15 @@
 //! Transaction orchestrator. See [`Sender`].
 
-use crate::{
-    Error, Message, PriorityQueue,
-    adapter::{
-        ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
-        RetryStrategy, SendOutcome,
-    },
-    clock::{Clock, SystemClock},
+use crate::adapter::{
+    ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
+    RetryStrategy, SendOutcome,
 };
+use crate::clock::{Clock, SystemClock};
+use crate::{Error, Message, PriorityQueue};
 use alloy::transports::RpcError::ErrorResp;
 use log::{debug, error};
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// Maximum number of transactions that may be in-flight simultaneously.
@@ -138,12 +137,13 @@ impl<A: ChainAdapter> Sender<A> {
                 let _permit = permit;
                 if let Err(e) = sender.process_message(msg).await {
                     match &e {
-                        Error::ChainError(crate::chain::Error::Rpc(ErrorResp(resp)))
-                            if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS =>
-                        {
-                            error!("Insufficient funds to send transaction; dropping message");
-                        }
-                        Error::ChainError(_) => {
+                        Error::ChainError(chain_err) => {
+                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err
+                                && resp.code == TX_FAILURE_INSUFFICIENT_FUNDS
+                            {
+                                error!("Insufficient funds to send transaction; dropping message");
+                                return;
+                            }
                             error!("Error processing message: {:?}", e);
                         }
                         _ => {
@@ -293,15 +293,13 @@ impl<A: ChainAdapter> Sender<A> {
 #[cfg(test)]
 mod tests {
     use super::Sender;
-    use crate::{
-        Message,
-        adapter::ethereum::{
-            Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
-        },
-        chain,
+    use crate::adapter::ethereum::{
+        Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
     };
+    use crate::{Message, chain};
     use alloy::primitives::Address;
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     // A minimal mock that satisfies NonceManager::new inside EthReplayProtection::new.
