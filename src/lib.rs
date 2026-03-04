@@ -33,10 +33,9 @@ use thiserror::Error;
 
 pub mod adapter;
 pub mod chain;
-mod clock;
-mod gas_price;
+pub(crate) mod gas_price;
 pub mod message;
-mod nonce_manager;
+pub(crate) mod nonce_manager;
 mod priority_queue;
 pub mod sender;
 
