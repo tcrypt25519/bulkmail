@@ -1,16 +1,17 @@
 //! Alloy WebSocket wrapper for Ethereum interaction. See [`Chain`] and [`ChainClient`].
 
-use alloy::primitives::{Address, BlockNumber, B256};
-use alloy::rpc::types::{Header, TransactionReceipt};
-use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect};
-use alloy::consensus::{TxEip1559, TypedTransaction};
-use alloy::network::{Ethereum, EthereumWallet, NetworkWallet};
-use alloy::signers::k256::ecdsa::SigningKey;
-use alloy::signers::local::PrivateKeySigner;
-use alloy::transports::{RpcError, TransportErrorKind};
+use alloy::{
+    consensus::{TxEip1559, TypedTransaction},
+    network::{Ethereum, EthereumWallet, NetworkWallet},
+    primitives::{Address, B256, BlockNumber},
+    providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, WsConnect},
+    rpc::types::{Header, TransactionReceipt},
+    signers::{k256::ecdsa::SigningKey, local::PrivateKeySigner},
+    transports::{RpcError, TransportErrorKind},
+};
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 /// An error originating from [`Chain`] operations.
 #[derive(Error, Debug)]
@@ -122,11 +123,15 @@ impl Chain {
     }
 
     /// Signs `tx` and broadcasts it, returning a watcher for confirmation.
-    pub async fn send_transaction(&self, tx: TxEip1559) -> Result<PendingTransactionBuilder<Ethereum>, Error> {
+    pub async fn send_transaction(
+        &self,
+        tx: TxEip1559,
+    ) -> Result<PendingTransactionBuilder<Ethereum>, Error> {
         let envelope = <EthereumWallet as NetworkWallet<Ethereum>>::sign_transaction(
             &self.wallet,
-            TypedTransaction::Eip1559(tx)
-        ).await?;
+            TypedTransaction::Eip1559(tx),
+        )
+        .await?;
         let pending = self.provider.send_tx_envelope(envelope).await?;
         Ok(pending)
     }
@@ -147,14 +152,9 @@ impl ChainClient for Chain {
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut sub = subscription;
-            loop {
-                match sub.recv().await {
-                    Ok(header) => {
-                        if tx.send(header).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(header) = sub.recv().await {
+                if tx.send(header).await.is_err() {
+                    break;
                 }
             }
         });

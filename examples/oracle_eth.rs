@@ -1,17 +1,16 @@
 use alloy::primitives::{Address, U256};
 use alloy_node_bindings::Anvil;
-use bulkmail::{Chain, Message, Sender};
-use log::{error, info, LevelFilter};
+use bulkmail::{
+    Chain, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, Message, Sender,
+};
+use log::{LevelFilter, error, info};
 use simple_logger::SimpleLogger;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::time::sleep;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("hex decoding error: {0}")]
-    HexDecode(#[from] hex::FromHexError),
     #[error("transaction manager error: {0}")]
     TM(#[from] bulkmail::Error),
     #[error("chain error: {0}")]
@@ -23,10 +22,17 @@ const BLOCK_TIME: u64 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    SimpleLogger::new().with_level(LevelFilter::Info).init().expect("Failed to initialize logger");
+    SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .init()
+        .expect("Failed to initialize logger");
 
     // Start Anvil server
-    let anvil = match Anvil::new().block_time(BLOCK_TIME).chain_id(CHAIN_ID).try_spawn() {
+    let anvil = match Anvil::new()
+        .block_time(BLOCK_TIME)
+        .chain_id(CHAIN_ID)
+        .try_spawn()
+    {
         Ok(a) => a,
         Err(e) => {
             error!("Anvil error: {}", e);
@@ -42,7 +48,12 @@ async fn main() -> Result<(), Error> {
 
     // Start services
     let chain = Chain::new(&anvil.ws_endpoint(), sender_key.clone().into(), CHAIN_ID).await?;
-    let sender = Arc::new(Sender::new(Arc::new(chain.clone()), sender_addr).await?);
+    let chain_arc: Arc<dyn bulkmail::LegacyChainClient> = Arc::new(chain.clone());
+    let client = Arc::new(EthClient::new(chain_arc.clone()));
+    let fees = Arc::new(EthFeeManager::new());
+    let replay = Arc::new(EthReplayProtection::new(chain_arc, sender_addr).await?);
+    let retry = Arc::new(EthRetryStrategy::new());
+    let sender = Arc::new(Sender::<Eth>::new(client, fees, replay, retry));
 
     // Spawn a new task for continuous message sending
     let sender_clone = sender.clone();
@@ -57,8 +68,11 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-
-async fn continuous_send(addr: Address, sender: Arc<Sender>, chain: Chain) -> Result<(), Error> {
+async fn continuous_send(
+    addr: Address,
+    sender: Arc<Sender<Eth>>,
+    chain: Chain,
+) -> Result<(), Error> {
     loop {
         // Send a new message
         let mut msg = Message::default();
