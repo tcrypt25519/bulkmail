@@ -3,6 +3,8 @@
 //! [`Message`]: Message
 
 use alloy::primitives::{Address, Bytes, U256};
+#[cfg(feature = "solana")]
+use solana_sdk::instruction::Instruction;
 use std::fmt::Display;
 
 pub(crate) const MAX_PRIORITY: u32 = 100;
@@ -87,6 +89,18 @@ pub struct Message {
 
     /// The number of times this message has been retried after a dropped transaction.
     retry_count: u32,
+
+    /// Optional Solana payload when the `solana` feature is enabled.
+    #[cfg(feature = "solana")]
+    pub solana: Option<SolanaPayload>,
+}
+
+/// Solana-specific transaction payload.
+#[cfg(feature = "solana")]
+#[derive(Debug, Clone)]
+pub struct SolanaPayload {
+    /// Ordered Solana instructions to execute.
+    pub instructions: Vec<Instruction>,
 }
 
 impl Message {
@@ -115,6 +129,29 @@ impl Message {
             deadline_ms,
             created_at_ms: now_ms,
             retry_count: 0,
+            #[cfg(feature = "solana")]
+            solana: None,
+        }
+    }
+
+    /// Creates a Solana [`Message`] with the given instructions.
+    #[cfg(feature = "solana")]
+    pub fn solana(
+        instructions: Vec<Instruction>,
+        priority: u32,
+        deadline_ms: Option<u32>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            to: None,
+            value: U256::ZERO,
+            data: Bytes::default(),
+            gas: 0,
+            priority: priority.min(MAX_PRIORITY),
+            deadline_ms,
+            created_at_ms: now_ms,
+            retry_count: 0,
+            solana: Some(SolanaPayload { instructions }),
         }
     }
 
@@ -215,6 +252,8 @@ impl Default for Message {
             deadline_ms: None,
             created_at_ms: SystemClock.now_ms(),
             retry_count: 0,
+            #[cfg(feature = "solana")]
+            solana: None,
         }
     }
 }
