@@ -4,6 +4,7 @@ use crate::adapter::{
     ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection, RetryDecision,
     RetryStrategy, SendOutcome,
 };
+use crate::clock::{Clock, SystemClock};
 use crate::{Error, Message, PriorityQueue};
 use alloy::transports::RpcError::ErrorResp;
 use log::{debug, error};
@@ -83,7 +84,8 @@ impl<A: ChainAdapter> Sender<A> {
     /// Enqueues `msg` for processing on the next available concurrency slot.
     pub async fn add_message(&self, msg: Message) {
         debug!("adding message {:?} {}", msg.to, msg.value);
-        self.queue.lock().await.push(msg);
+        let now_ms = SystemClock.now_ms();
+        self.queue.lock().await.push(msg, now_ms);
         self.message_ready.notify_one();
     }
 
@@ -136,13 +138,11 @@ impl<A: ChainAdapter> Sender<A> {
                 if let Err(e) = sender.process_message(msg).await {
                     match &e {
                         Error::ChainError(chain_err) => {
-                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err {
-                                if resp.code == TX_FAILURE_INSUFFICIENT_FUNDS {
-                                    error!(
-                                        "Insufficient funds to send transaction; dropping message"
-                                    );
-                                    return;
-                                }
+                            if let crate::chain::Error::Rpc(ErrorResp(resp)) = chain_err
+                                && resp.code == TX_FAILURE_INSUFFICIENT_FUNDS
+                            {
+                                error!("Insufficient funds to send transaction; dropping message");
+                                return;
                             }
                             error!("Error processing message: {:?}", e);
                         }
@@ -163,6 +163,7 @@ impl<A: ChainAdapter> Sender<A> {
     /// immediately before submission.
     async fn process_message(&self, msg: Message) -> Result<(), Error> {
         debug!("processing message {:?} {}", msg.to, msg.value);
+
         let now_ms = SystemClock.now_ms();
 
         if msg.is_expired(now_ms) {
@@ -293,9 +294,9 @@ impl<A: ChainAdapter> Sender<A> {
 mod tests {
     use super::Sender;
     use crate::adapter::ethereum::{
-        bump_by_percent, Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy,
+        Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy, bump_by_percent,
     };
-    use crate::{chain, Message};
+    use crate::{Message, chain};
     use alloy::primitives::Address;
     use std::sync::Arc;
     use std::time::Duration;

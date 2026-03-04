@@ -1,6 +1,7 @@
 //! Network congestion detection and priority-fee scaling. See [`GasPriceManager`].
 
-use crate::{Error, message::MAX_PRIORITY};
+use crate::Error;
+use crate::message::MAX_PRIORITY;
 use std::{collections::VecDeque, time::Duration};
 use tokio::sync::Mutex;
 
