@@ -60,10 +60,7 @@ impl ChainClient<SolAdapterTest> for SolClientTest {
         })
     }
 
-    async fn get_transaction_status(
-        &self,
-        _id: &Signature,
-    ) -> Result<TransactionStatus, Error> {
+    async fn get_transaction_status(&self, _id: &Signature) -> Result<TransactionStatus, Error> {
         Ok(TransactionStatus::Confirmed { number: 1 })
     }
 }
