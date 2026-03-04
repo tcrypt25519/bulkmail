@@ -23,7 +23,7 @@ jobs:
     name: Check Rust (PR)
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write    # needed for PR comments (e.g., Codecov)
     steps:
       - name: Checkout
