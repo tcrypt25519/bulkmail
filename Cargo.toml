@@ -7,6 +7,10 @@ description = "Transaction sending system"
 license = "MIT OR Apache-2.0"
 
 [features]
+# Default to Ethereum until Solana support is implemented.
+default = ["ethereum"]
+ethereum = []
+solana = ["dep:solana-sdk", "dep:solana-client", "dep:solana-transaction-status"]
 # Opt-in structured logging via the tracing ecosystem.
 tracing = ["dep:tracing"]
 
@@ -31,6 +35,9 @@ alloy = { version = "1.7.3", default-features = false, features = [
 ] }
 alloy-node-bindings = "1.7.3"
 simple_logger = "5.2.0"
+solana-sdk = { version = "2.2", optional = true, default-features = false }
+solana-client = { version = "2.2", optional = true, default-features = false }
+solana-transaction-status = { version = "2.2", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
@@ -39,6 +46,10 @@ mockall = "0.14.0"
 [[example]]
 name = "oracle_eth"
 path = "examples/oracle_eth.rs"
+
+[[example]]
+name = "oracle_sol"
+path = "examples/oracle_sol.rs"
 
 [lib]
 name = "bulkmail"

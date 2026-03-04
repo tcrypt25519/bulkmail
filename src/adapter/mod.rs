@@ -9,6 +9,8 @@
 //! type level.
 
 pub mod ethereum;
+#[cfg(feature = "solana")]
+pub mod solana;
 
 use crate::Error;
 use async_trait::async_trait;

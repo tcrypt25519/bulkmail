@@ -40,8 +40,14 @@ pub(crate) mod nonce_manager;
 mod priority_queue;
 pub mod sender;
 
+#[cfg(not(any(feature = "ethereum", feature = "solana")))]
+compile_error!("At least one chain feature (\"ethereum\" or \"solana\") must be enabled.");
+
 // Re-export main components for easier use
+#[cfg(feature = "ethereum")]
 pub use adapter::ethereum::{Eth, EthClient, EthFeeManager, EthReplayProtection, EthRetryStrategy};
+#[cfg(feature = "solana")]
+pub use adapter::solana::{Sol, SolClient, SolFeeManager, SolReplayProtection, SolRetryStrategy};
 pub use chain::{Chain, ChainClient as LegacyChainClient};
 pub(crate) use gas_price::GasPriceManager;
 pub use message::Message;
