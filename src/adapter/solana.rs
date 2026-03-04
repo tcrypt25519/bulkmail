@@ -16,11 +16,13 @@ use solana_client::{
     pubsub_client::PubsubClient,
 };
 use solana_sdk::{
+    commitment_config::CommitmentConfig,
     hash::Hash, instruction::Instruction, signature::Signature, transaction::VersionedTransaction,
 };
 use solana_transaction_status::TransactionConfirmationStatus;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// Solana fee parameters (placeholder).
 #[derive(Debug, Clone)]
@@ -161,16 +163,70 @@ impl FeeManager<Sol> for SolFeeManager {
 }
 
 /// Solana replay protection (blockhash cache placeholder).
-pub struct SolReplayProtection;
+pub struct SolReplayProtection {
+    rpc: Arc<RpcClient>,
+    state: Mutex<BlockhashState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockhashState {
+    hash: Hash,
+    last_valid_block_height: u64,
+}
+
+const BLOCKHASH_REFRESH_MARGIN: u64 = 30;
+
+impl SolReplayProtection {
+    pub async fn new(rpc: Arc<RpcClient>) -> Result<Self, Error> {
+        let (hash, last_valid_block_height) = rpc
+            .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+            .await
+            .map_err(|err| Error::SolanaError(format!("get_latest_blockhash failed: {err}")))?;
+
+        Ok(Self {
+            rpc,
+            state: Mutex::new(BlockhashState {
+                hash,
+                last_valid_block_height,
+            }),
+        })
+    }
+}
 
 #[async_trait]
 impl ReplayProtection<Sol> for SolReplayProtection {
     async fn next(&self) -> Hash {
-        todo!("Return most recent cached blockhash");
+        let state = self.state.lock().await;
+        state.hash
     }
 
     async fn sync(&self) -> Result<(), Error> {
-        todo!("Refresh cached blockhash / lastValidBlockHeight");
+        let current_height = self
+            .rpc
+            .get_block_height()
+            .await
+            .map_err(|err| Error::SolanaError(format!("get_block_height failed: {err}")))?;
+
+        let should_refresh = {
+            let state = self.state.lock().await;
+            current_height + BLOCKHASH_REFRESH_MARGIN >= state.last_valid_block_height
+        };
+
+        if should_refresh {
+            let (hash, last_valid_block_height) = self
+                .rpc
+                .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                .await
+                .map_err(|err| {
+                    Error::SolanaError(format!("get_latest_blockhash failed: {err}"))
+                })?;
+
+            let mut state = self.state.lock().await;
+            state.hash = hash;
+            state.last_valid_block_height = last_valid_block_height;
+        }
+
+        Ok(())
     }
 }
 
