@@ -1,4 +1,4 @@
-//! Solana adapter — TODO: implement Solana support behind the `solana` feature.
+//! Solana adapter — partial Solana support behind the `solana` feature.
 //!
 //! [`Sol`] is the zero-sized tag type. Instantiate a [`Sender<Sol>`] once the
 //! Solana adapter is implemented.
@@ -13,13 +13,20 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+use log::warn;
 use solana_client::{nonblocking::rpc_client::RpcClient, pubsub_client::PubsubClient};
 use solana_sdk::{
-    commitment_config::CommitmentConfig, hash::Hash, instruction::Instruction,
-    signature::Signature, transaction::VersionedTransaction,
+    commitment_config::CommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    message::Message as SolanaMessage,
+    signature::{Keypair, Signature, Signer},
+    transaction::{TransactionError, VersionedTransaction},
 };
 use solana_transaction_status::TransactionConfirmationStatus;
-use std::{sync::Arc, time::Duration};
+use std::cmp::min;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Solana fee parameters (placeholder).
@@ -29,6 +36,15 @@ pub struct SolFeeParams {
     pub compute_unit_price: u64,
     /// Compute unit limit.
     pub compute_unit_limit: u32,
+}
+
+impl Default for SolFeeParams {
+    fn default() -> Self {
+        Self {
+            compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
+        }
+    }
 }
 
 /// Solana adapter tag type. All SOL-specific types are associated here.
@@ -48,14 +64,20 @@ impl ChainAdapter for Sol {
 pub struct SolClient {
     rpc: Arc<RpcClient>,
     pubsub_url: String,
+    payer: Arc<Keypair>,
 }
 
 impl SolClient {
     #[allow(dead_code)]
-    pub fn new(rpc: Arc<RpcClient>, pubsub_url: impl Into<String>) -> Self {
+    pub fn new(
+        rpc: Arc<RpcClient>,
+        pubsub_url: impl Into<String>,
+        payer: Arc<Keypair>,
+    ) -> Self {
         Self {
             rpc,
             pubsub_url: pubsub_url.into(),
+            payer,
         }
     }
 }
@@ -89,13 +111,61 @@ impl ChainClient<Sol> for SolClient {
 
     async fn send_transaction(
         &self,
-        _msg: &crate::Message,
-        _fee: &SolFeeParams,
-        _replay_token: &Hash,
+        msg: &crate::Message,
+        fee: &SolFeeParams,
+        replay_token: &Hash,
     ) -> Result<SendOutcome<Sol>, Error> {
-        Err(Error::SolanaError(
-            "send_transaction not implemented for Solana yet".to_string(),
-        ))
+        let payload = msg
+            .solana
+            .as_ref()
+            .ok_or_else(|| Error::SolanaError("missing solana payload".to_string()))?;
+
+        let mut instructions = Vec::with_capacity(payload.instructions.len() + 2);
+        if fee.compute_unit_limit > 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                fee.compute_unit_limit,
+            ));
+        }
+        if fee.compute_unit_price > 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                fee.compute_unit_price,
+            ));
+        }
+        instructions.extend(payload.instructions.iter().cloned());
+
+        let payer = self.payer.pubkey();
+        let message = SolanaMessage::new_with_blockhash(&instructions, Some(&payer), replay_token);
+        let tx = VersionedTransaction::try_new(message, &[self.payer.as_ref()]).map_err(|err| {
+            Error::SolanaError(format!("failed to sign transaction: {err}"))
+        })?;
+
+        let signature = self
+            .rpc
+            .send_transaction(&tx)
+            .await
+            .map_err(|err| Error::SolanaError(format!("send_transaction failed: {err}")))?;
+
+        let start = std::time::Instant::now();
+        loop {
+            let status = self.get_transaction_status(&signature).await?;
+            match status {
+                TransactionStatus::Confirmed { .. } | TransactionStatus::Finalized { .. } => {
+                    return Ok(SendOutcome::Confirmed { tx_id: signature })
+                }
+                TransactionStatus::Failed { .. } => {
+                    return Ok(SendOutcome::Reverted { tx_id: signature })
+                }
+                TransactionStatus::Expired => {
+                    return Ok(SendOutcome::Dropped { tx_id: signature })
+                }
+                TransactionStatus::Pending => {
+                    if start.elapsed() >= Duration::from_secs(SOLANA_TX_TIMEOUT_SECS) {
+                        return Ok(SendOutcome::Dropped { tx_id: signature });
+                    }
+                    tokio::time::sleep(Duration::from_millis(SOLANA_STATUS_POLL_MS)).await;
+                }
+            }
+        }
     }
 
     async fn get_transaction_status(&self, _id: &Signature) -> Result<TransactionStatus, Error> {
@@ -115,6 +185,9 @@ impl ChainClient<Sol> for SolClient {
         };
 
         if let Some(err) = status.err {
+            if matches!(err, TransactionError::BlockhashNotFound) {
+                return Ok(TransactionStatus::Expired);
+            }
             return Ok(TransactionStatus::Failed {
                 reason: format!("{err:?}"),
             });
@@ -138,23 +211,31 @@ pub struct SolFeeManager;
 
 #[async_trait]
 impl FeeManager<Sol> for SolFeeManager {
-    async fn get_fee_params(&self, _priority: u32) -> Result<SolFeeParams, Error> {
-        todo!("Use getRecentPrioritizationFees to derive CU price/limit");
+    async fn get_fee_params(&self, priority: u32) -> Result<SolFeeParams, Error> {
+        let priority = min(priority, crate::message::MAX_PRIORITY) as u64;
+        let price_range = MAX_COMPUTE_UNIT_PRICE.saturating_sub(DEFAULT_COMPUTE_UNIT_PRICE);
+        let price = DEFAULT_COMPUTE_UNIT_PRICE
+            .saturating_add(price_range.saturating_mul(priority) / crate::message::MAX_PRIORITY as u64);
+
+        Ok(SolFeeParams {
+            compute_unit_price: price,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
+        })
     }
 
     async fn update_on_confirmation(&self, _confirmation_time: Duration, _fee_paid: &SolFeeParams) {
-        todo!("Update internal fee model from confirmation latency");
+        // Placeholder for future fee model updates.
     }
 
     fn bump_fee(&self, current: &SolFeeParams) -> SolFeeParams {
         SolFeeParams {
-            compute_unit_price: current.compute_unit_price.saturating_add(1),
+            compute_unit_price: bump_by_percent(current.compute_unit_price, FEE_BUMP_PERCENT),
             compute_unit_limit: current.compute_unit_limit,
         }
     }
 
     async fn get_base_fee(&self) -> SolFeeParams {
-        todo!("Return baseline fee params");
+        Ok(SolFeeParams::default())
     }
 }
 
@@ -236,7 +317,17 @@ impl RetryStrategy<Sol> for SolRetryStrategy {
         _fees: &SolFeeManager,
         _replay: &SolReplayProtection,
     ) -> RetryDecision<Sol> {
-        todo!("Resubmit with fresh blockhash + bumped CU price");
+        if let Err(err) = _replay.sync().await {
+            warn!("failed to refresh blockhash after drop: {err:?}");
+            return RetryDecision::Requeue;
+        }
+
+        let new_fee = _fees.bump_fee(&_pending.fee);
+        let new_replay = _replay.next().await;
+        RetryDecision::Resubmit {
+            fee: new_fee,
+            replay_token: new_replay,
+        }
     }
 
     async fn handle_confirmed(
@@ -246,13 +337,23 @@ impl RetryStrategy<Sol> for SolRetryStrategy {
         _replay: &SolReplayProtection,
         _confirmation_time: Duration,
     ) {
-        todo!("Update fee model / replay protection state");
+        _fees
+            .update_on_confirmation(_confirmation_time, &_pending.fee)
+            .await;
+        if let Err(err) = _replay.sync().await {
+            warn!("failed to refresh blockhash after confirmation: {err:?}");
+        }
     }
 }
 
-// --- Solana payload helpers (placeholder) -----------------------------------
+const DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const DEFAULT_COMPUTE_UNIT_PRICE: u64 = 0;
+const MAX_COMPUTE_UNIT_PRICE: u64 = 10_000;
+const FEE_BUMP_PERCENT: u64 = 20;
+const SOLANA_TX_TIMEOUT_SECS: u64 = 30;
+const SOLANA_STATUS_POLL_MS: u64 = 500;
 
-#[allow(dead_code)]
-fn build_transaction(_instructions: Vec<Instruction>, _blockhash: Hash) -> VersionedTransaction {
-    todo!("Construct VersionedTransaction with payer + instructions");
+fn bump_by_percent(value: u64, percent: u64) -> u64 {
+    let bump = value.saturating_mul(percent) / 100;
+    value.saturating_add(bump)
 }
