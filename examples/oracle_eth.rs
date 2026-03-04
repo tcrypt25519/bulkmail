@@ -79,7 +79,7 @@ async fn continuous_send(
         msg.to = Some(Address::default());
         msg.gas = 21_000u64;
         msg.value = U256::from(1_000_000u64); // 1 gwei
-        sender.add_message(msg);
+        sender.add_message(msg).await;
 
         // Generate a random delay between 500ms and 1s
         let delay = rand::random_range(20..200);
