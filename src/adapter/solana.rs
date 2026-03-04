@@ -24,9 +24,7 @@ use solana_sdk::{
     transaction::{TransactionError, VersionedTransaction},
 };
 use solana_transaction_status::TransactionConfirmationStatus;
-use std::cmp::min;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{cmp::min, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 /// Solana fee parameters (placeholder).
@@ -69,11 +67,7 @@ pub struct SolClient {
 
 impl SolClient {
     #[allow(dead_code)]
-    pub fn new(
-        rpc: Arc<RpcClient>,
-        pubsub_url: impl Into<String>,
-        payer: Arc<Keypair>,
-    ) -> Self {
+    pub fn new(rpc: Arc<RpcClient>, pubsub_url: impl Into<String>, payer: Arc<Keypair>) -> Self {
         Self {
             rpc,
             pubsub_url: pubsub_url.into(),
@@ -135,9 +129,8 @@ impl ChainClient<Sol> for SolClient {
 
         let payer = self.payer.pubkey();
         let message = SolanaMessage::new_with_blockhash(&instructions, Some(&payer), replay_token);
-        let tx = VersionedTransaction::try_new(message, &[self.payer.as_ref()]).map_err(|err| {
-            Error::SolanaError(format!("failed to sign transaction: {err}"))
-        })?;
+        let tx = VersionedTransaction::try_new(message, &[self.payer.as_ref()])
+            .map_err(|err| Error::SolanaError(format!("failed to sign transaction: {err}")))?;
 
         let signature = self
             .rpc
@@ -150,14 +143,12 @@ impl ChainClient<Sol> for SolClient {
             let status = self.get_transaction_status(&signature).await?;
             match status {
                 TransactionStatus::Confirmed { .. } | TransactionStatus::Finalized { .. } => {
-                    return Ok(SendOutcome::Confirmed { tx_id: signature })
+                    return Ok(SendOutcome::Confirmed { tx_id: signature });
                 }
                 TransactionStatus::Failed { .. } => {
-                    return Ok(SendOutcome::Reverted { tx_id: signature })
+                    return Ok(SendOutcome::Reverted { tx_id: signature });
                 }
-                TransactionStatus::Expired => {
-                    return Ok(SendOutcome::Dropped { tx_id: signature })
-                }
+                TransactionStatus::Expired => return Ok(SendOutcome::Dropped { tx_id: signature }),
                 TransactionStatus::Pending => {
                     if start.elapsed() >= Duration::from_secs(SOLANA_TX_TIMEOUT_SECS) {
                         return Ok(SendOutcome::Dropped { tx_id: signature });
@@ -214,8 +205,9 @@ impl FeeManager<Sol> for SolFeeManager {
     async fn get_fee_params(&self, priority: u32) -> Result<SolFeeParams, Error> {
         let priority = min(priority, crate::message::MAX_PRIORITY) as u64;
         let price_range = MAX_COMPUTE_UNIT_PRICE.saturating_sub(DEFAULT_COMPUTE_UNIT_PRICE);
-        let price = DEFAULT_COMPUTE_UNIT_PRICE
-            .saturating_add(price_range.saturating_mul(priority) / crate::message::MAX_PRIORITY as u64);
+        let price = DEFAULT_COMPUTE_UNIT_PRICE.saturating_add(
+            price_range.saturating_mul(priority) / crate::message::MAX_PRIORITY as u64,
+        );
 
         Ok(SolFeeParams {
             compute_unit_price: price,
