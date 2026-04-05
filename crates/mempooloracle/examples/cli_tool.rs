@@ -1,4 +1,4 @@
-use alloy::providers::{ProviderBuilder, WsConnect};
+use alloy::providers::{ProviderBuilder, WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker,
@@ -41,7 +41,11 @@ async fn main() -> io::Result<()> {
         DataSource::Live { ws_url } => Runtime::Live(
             MempoolTracker::connect_with_builder(
                 ProviderBuilder::default(),
-                WsConnect::new(ws_url),
+                WsConnect::new(ws_url).with_config(
+                    WebSocketConfig::default()
+                        .max_message_size(Some(128 << 20))
+                        .max_frame_size(Some(128 << 20)),
+                ),
                 config,
             )
             .await

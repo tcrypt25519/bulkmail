@@ -217,12 +217,24 @@ impl MempoolInner {
 
         // Get or create the account queue.
         let account_queue = self.account_queues.entry(tx.sender).or_insert_with(|| {
-            let confirmed_nonce = tx.nonce.saturating_sub(1);
+            let confirmed_nonce = tx.nonce;
             AccountQueue {
                 confirmed_nonce,
                 slots: Vec::new(),
             }
         });
+
+        if tx.nonce < account_queue.confirmed_nonce {
+            let prepend = (account_queue.confirmed_nonce - tx.nonce) as usize;
+            if prepend + account_queue.slots.len() > self.config.per_account_capacity {
+                return;
+            }
+
+            let mut shifted_slots = vec![None; prepend];
+            shifted_slots.append(&mut account_queue.slots);
+            account_queue.slots = shifted_slots;
+            account_queue.confirmed_nonce = tx.nonce;
+        }
 
         // Per-account capacity check
         let nonce_offset = (tx.nonce - account_queue.confirmed_nonce) as usize;

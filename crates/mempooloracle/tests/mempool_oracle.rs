@@ -183,4 +183,43 @@ mod tests {
         assert!(handle.classification(&tx1.id).is_none());
         assert!(handle.classification(&tx3.id).is_some());
     }
+
+    #[test]
+    fn test_out_of_order_nonce_insert_from_backfill() {
+        let sender_addr = Address([7; 20]);
+        let tx_high = PendingTx {
+            id: TxId([5; 32]),
+            sender: sender_addr,
+            nonce: 5,
+            max_fee_per_gas: 20,
+            max_priority_fee_per_gas: 10,
+            gas_limit: 21_000,
+        };
+        let tx_low = PendingTx {
+            id: TxId([4; 32]),
+            sender: sender_addr,
+            nonce: 4,
+            max_fee_per_gas: 20,
+            max_priority_fee_per_gas: 10,
+            gas_limit: 21_000,
+        };
+
+        let (handle, sender) = new_tracker(&[], default_config());
+        sender
+            .send(MempoolEvent::PendingTransaction(tx_high.clone()))
+            .unwrap();
+        sender
+            .send(MempoolEvent::PendingTransaction(tx_low.clone()))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(handle.classification(&tx_low.id), Some(TxClassification::Marketable));
+        assert_eq!(
+            handle.classification(&tx_high.id),
+            Some(TxClassification::Marketable)
+        );
+        assert!(handle.find_tx_by_addr_and_nonce(sender_addr, 4).is_some());
+        assert!(handle.find_tx_by_addr_and_nonce(sender_addr, 5).is_some());
+    }
 }

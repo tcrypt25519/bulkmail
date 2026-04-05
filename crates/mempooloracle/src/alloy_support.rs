@@ -22,7 +22,7 @@ use tokio::{sync::watch, task::JoinHandle, time::{Duration, timeout}};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
-const BACKFILL_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum AlloyTrackerError {
@@ -116,11 +116,7 @@ async fn connect_erased_provider(
     ));
     let pending_task = tokio::spawn(run_pending_subscription(event_tx, shutdown_rx, pending_sub));
 
-    let initial_txs = timeout(BACKFILL_TIMEOUT, backfill_mempool(&provider))
-        .await
-        .map_err(|_| AlloyTrackerError::Timeout {
-            stage: "txpool backfill",
-        })??;
+    let initial_txs = backfill_mempool(&provider).await?;
 
     let (handle, tracker) = MempoolTracker::from_channel(event_rx, &initial_txs, config);
     thread::spawn(move || tracker.run());
@@ -133,15 +129,22 @@ async fn connect_erased_provider(
 }
 
 async fn backfill_mempool(provider: &DynProvider) -> Result<Vec<PendingTx>, AlloyTrackerError> {
-    let txpool: TxpoolContents = match provider
-        .raw_request("txpool_contents".into(), NoParams::default())
-        .await
+    let txpool: TxpoolContents = match timeout(
+        BACKFILL_TIMEOUT,
+        provider.raw_request("txpool_contents".into(), NoParams::default()),
+    )
+    .await
     {
-        Ok(contents) => contents,
-        Err(_) => {
-            provider
-                .raw_request("txpool_content".into(), NoParams::default())
-                .await?
+        Ok(Ok(contents)) => contents,
+        Ok(Err(_)) | Err(_) => {
+            timeout(
+                BACKFILL_TIMEOUT,
+                provider.raw_request("txpool_content".into(), NoParams::default()),
+            )
+            .await
+            .map_err(|_| AlloyTrackerError::Timeout {
+                stage: "txpool_content backfill",
+            })??
         }
     };
 
