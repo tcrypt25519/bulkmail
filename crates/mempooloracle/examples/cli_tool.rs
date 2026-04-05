@@ -3,41 +3,107 @@ use mempooloracle::{
     TxId,
 };
 use std::{
-    sync::mpsc,
+    env, process,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 fn main() {
-    let (handle, event_sender) = {
+    let duration_secs = parse_duration_secs();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let (handle, event_sender, tracker_thread) = {
         let (event_sender, event_receiver) = mpsc::channel();
         let config = TrackerConfig {
             initial_base_fee: 10,
             global_capacity: 1000,
             per_account_capacity: 100,
-            private_flow_prior: 0.1, // Start with a 10% private flow estimate
+            private_flow_prior: 0.1,
         };
         let (handle, tracker) = MempoolTracker::new(event_receiver, &[], config);
-        thread::spawn(move || tracker.run());
-        (handle, event_sender)
+        let tracker_thread = thread::spawn(move || tracker.run());
+        (handle, event_sender, tracker_thread)
     };
 
-    // Spawn a thread to simulate blockchain events
+    let simulation_stop = stop.clone();
     let event_sender_clone = event_sender.clone();
-    thread::spawn(move || simulate_blockchain(event_sender_clone));
+    let simulation_thread =
+        thread::spawn(move || simulate_blockchain(event_sender_clone, simulation_stop));
 
-    // Main loop to display stats every 2 seconds
-    display_stats(handle);
+    if duration_secs == 0 {
+        display_stats(handle, None, stop);
+    } else {
+        display_stats(
+            handle,
+            Some(Instant::now() + Duration::from_secs(duration_secs)),
+            stop.clone(),
+        );
+        stop.store(true, Ordering::Relaxed);
+        drop(event_sender);
+        let _ = simulation_thread.join();
+        let _ = tracker_thread.join();
+    }
 }
 
-fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>) {
+fn parse_duration_secs() -> u64 {
+    let mut args = env::args().skip(1);
+    let mut duration_secs = 30_u64;
+
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--duration=") {
+            duration_secs = parse_duration_value(value);
+            continue;
+        }
+
+        if arg == "--duration" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --duration");
+                print_usage_and_exit();
+            };
+            duration_secs = parse_duration_value(&value);
+            continue;
+        }
+
+        eprintln!("unrecognized argument: {arg}");
+        print_usage_and_exit();
+    }
+
+    duration_secs
+}
+
+fn parse_duration_value(value: &str) -> u64 {
+    match value.parse::<u64>() {
+        Ok(duration_secs) => duration_secs,
+        Err(_) => {
+            eprintln!("invalid duration value: {value}");
+            print_usage_and_exit();
+        }
+    }
+}
+
+fn print_usage_and_exit() -> ! {
+    eprintln!("usage: cargo run -p mempooloracle --example cli_tool -- [--duration <seconds>]");
+    eprintln!("default: --duration 30");
+    eprintln!("use --duration 0 to run until interrupted");
+    process::exit(2);
+}
+
+fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>, stop: Arc<AtomicBool>) {
     let mut nonce = 0;
     let sender = Address([1; 20]);
     let mut block_number = 0;
 
-    loop {
-        // Send a burst of transactions
+    while !stop.load(Ordering::Relaxed) {
         for _ in 0..10 {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
             let tx = PendingTx {
                 id: TxId([nonce as u8; 32]),
                 sender,
@@ -46,13 +112,16 @@ fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>) {
                 max_priority_fee_per_gas: 1 + (nonce % 5) as u128,
                 gas_limit: 21000,
             };
-            events.send(MempoolEvent::PendingTransaction(tx)).unwrap();
+            if events.send(MempoolEvent::PendingTransaction(tx)).is_err() {
+                return;
+            }
             nonce += 1;
         }
 
-        thread::sleep(Duration::from_secs(5));
+        if should_stop_for(&stop, Duration::from_secs(5)) {
+            return;
+        }
 
-        // Create a new block that includes some of the transactions
         let block_tx_count = 5;
         let included_txs: Vec<PendingTx> = (0..block_tx_count)
             .map(|i| {
@@ -82,14 +151,23 @@ fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>) {
             block.included_txs.len()
         );
 
-        events.send(MempoolEvent::NewBlock(block)).unwrap();
+        if events.send(MempoolEvent::NewBlock(block)).is_err() {
+            return;
+        }
         block_number += 1;
     }
 }
 
-fn display_stats(handle: MempoolHandle) {
+fn display_stats(handle: MempoolHandle, deadline: Option<Instant>, stop: Arc<AtomicBool>) {
     let mut last_run = Instant::now();
+
     loop {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            return;
+        }
+
         if last_run.elapsed() >= Duration::from_secs(2) {
             let base_fee = handle.current_base_fee();
             let private_flow = handle.private_flow_ratio();
@@ -103,7 +181,6 @@ fn display_stats(handle: MempoolHandle) {
             let pq = handle.priority_queue();
 
             for (fee, addr, nonce) in pq.iter().rev() {
-                // Iterate in reverse for high-to-low priority
                 if let Some(tx) = handle.find_tx_by_addr_and_nonce(*addr, *nonce) {
                     if gas_used + tx.gas_limit > usable_capacity {
                         break;
@@ -121,6 +198,25 @@ fn display_stats(handle: MempoolHandle) {
 
             last_run = Instant::now();
         }
+
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn should_stop_for(stop: &AtomicBool, duration: Duration) -> bool {
+    let started = Instant::now();
+
+    while started.elapsed() < duration {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        let remaining = duration.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+
+    stop.load(Ordering::Relaxed)
 }
