@@ -1500,6 +1500,7 @@ dependencies = [
  "ethereum-types",
  "futures",
  "log",
+ "mempooloracle",
  "mockall",
  "parking_lot",
  "rand 0.10.0",
@@ -3549,6 +3550,10 @@ checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "mempooloracle"
+version = "0.1.0"
 
 [[package]]
 name = "merlin"

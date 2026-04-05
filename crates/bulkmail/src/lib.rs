@@ -40,6 +40,10 @@ pub(crate) mod nonce_manager;
 mod priority_queue;
 pub mod sender;
 
+pub mod mempool_oracle {
+    pub use mempooloracle::*;
+}
+
 #[cfg(not(any(feature = "ethereum", feature = "solana")))]
 compile_error!("At least one chain feature (\"ethereum\" or \"solana\") must be enabled.");
 
@@ -50,6 +54,10 @@ pub use adapter::ethereum::{Eth, EthClient, EthFeeManager, EthReplayProtection, 
 pub use adapter::solana::{Sol, SolClient, SolFeeManager, SolReplayProtection, SolRetryStrategy};
 pub use chain::{Chain, ChainClient as LegacyChainClient};
 pub(crate) use gas_price::GasPriceManager;
+pub use mempooloracle::{
+    Address, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, PendingTx, TrackerConfig,
+    TxClassification, TxId,
+};
 pub use message::Message;
 pub(crate) use nonce_manager::NonceManager;
 pub(crate) use priority_queue::PriorityQueue;

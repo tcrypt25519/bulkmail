@@ -1,0 +1,12 @@
+[package]
+name = "mempooloracle"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Mempool tracking and confirmation-latency oracle for EIP-1559"
+
+[lib]
+name = "mempooloracle"
+path = "src/lib.rs"
+

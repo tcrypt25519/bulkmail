@@ -1,34 +1,14 @@
-[package]
-name = "bulkmail"
+[workspace]
+members = ["crates/bulkmail", "crates/mempooloracle"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 authors = ["Tyler Smith <mail@tcry.pt>"]
-description = "Transaction sending system"
 license = "MIT OR Apache-2.0"
 
-[features]
-# Default to Ethereum until Solana support is implemented.
-default = ["ethereum"]
-ethereum = []
-solana = [
-    "dep:solana-sdk",
-    "dep:solana-client",
-    "dep:solana-transaction-status",
-]
-# Opt-in structured logging via the tracing ecosystem.
-tracing = ["dep:tracing"]
-
-[dependencies]
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-async-trait = "0.1.89"
-parking_lot = "0.12.1"
-log = "0.4.29"
-futures = "0.3.32"
-rand = "0.10.0"
-thiserror = "2.0.18"
-secp256k1 = "0.31.1"
-ethereum-types = "0.16.0"
-tracing = { version = "0.1", optional = true }
+[workspace.dependencies]
 alloy = { version = "1.7.3", default-features = false, features = [
     "std",
     "provider-ws",
@@ -36,27 +16,23 @@ alloy = { version = "1.7.3", default-features = false, features = [
     "signer-local",
     "k256",
 ] }
-simple_logger = "5.2.0"
-solana-sdk = { version = "2.2", optional = true, default-features = false, features = ["full"] }
-solana-client = { version = "2.2", optional = true, default-features = false }
-solana-transaction-status = { version = "2.2", optional = true, default-features = false }
-
-[dev-dependencies]
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
-mockall = "0.14.0"
 alloy-node-bindings = "1.7.3"
-
-[[example]]
-name = "oracle_eth"
-path = "examples/oracle_eth.rs"
-
-[[example]]
-name = "oracle_sol"
-path = "examples/oracle_sol.rs"
-
-[lib]
-name = "bulkmail"
-path = "src/lib.rs"
+async-trait = "0.1.89"
+ethereum-types = "0.16.0"
+futures = "0.3.32"
+log = "0.4.29"
+mockall = "0.14.0"
+mempooloracle = { path = "crates/mempooloracle", version = "0.1.0" }
+parking_lot = "0.12.1"
+rand = "0.10.0"
+secp256k1 = "0.31.1"
+simple_logger = "5.2.0"
+solana-client = { version = "2.2", default-features = false }
+solana-sdk = { version = "2.2", default-features = false, features = ["full"] }
+solana-transaction-status = { version = "2.2", default-features = false }
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,52 @@
+[package]
+name = "bulkmail"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Transaction sending system"
+
+[features]
+default = ["ethereum"]
+ethereum = []
+solana = [
+    "dep:solana-sdk",
+    "dep:solana-client",
+    "dep:solana-transaction-status",
+]
+tracing = ["dep:tracing"]
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+ethereum-types.workspace = true
+futures.workspace = true
+log.workspace = true
+mempooloracle.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
+simple_logger.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing = { workspace = true, optional = true }
+solana-sdk = { workspace = true, optional = true }
+solana-client = { workspace = true, optional = true }
+solana-transaction-status = { workspace = true, optional = true }
+
+[dev-dependencies]
+alloy-node-bindings.workspace = true
+mockall.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lib]
+name = "bulkmail"
+path = "src/lib.rs"
+
+[[example]]
+name = "oracle_eth"
+path = "examples/oracle_eth.rs"
+
+[[example]]
+name = "oracle_sol"
+path = "examples/oracle_sol.rs"
