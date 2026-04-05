@@ -57,6 +57,7 @@ where
     F: TxFiller<Ethereum> + ProviderLayer<L::Provider, Ethereum>,
     F::Provider: 'static,
 {
+    install_rustls_provider();
     let provider = builder.connect_ws(ws).await?.erased();
     connect_erased_provider(provider, config).await
 }
@@ -69,6 +70,10 @@ where
     P: Provider<Ethereum> + 'static,
 {
     connect_erased_provider(provider.erased(), config).await
+}
+
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn connect_erased_provider(

@@ -11,6 +11,7 @@ alloy.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 ratatui.workspace = true
+rustls.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

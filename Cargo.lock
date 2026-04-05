@@ -3705,6 +3705,7 @@ dependencies = [
  "crossterm 0.29.0",
  "futures",
  "ratatui",
+ "rustls 0.23.36",
  "serde",
  "thiserror 2.0.18",
  "tokio",
