@@ -16,7 +16,15 @@ use alloy::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
-use std::{collections::HashMap, sync::mpsc, thread};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle, time::{Duration, timeout}};
 
@@ -34,6 +42,7 @@ pub enum AlloyTrackerError {
 
 pub struct AlloyTrackerRuntime {
     handle: MempoolHandle,
+    telemetry: Arc<RuntimeTelemetry>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -41,6 +50,12 @@ pub struct AlloyTrackerRuntime {
 impl AlloyTrackerRuntime {
     pub fn handle(&self) -> MempoolHandle {
         self.handle.clone()
+    }
+
+    pub fn telemetry(&self) -> AlloyTrackerTelemetry {
+        AlloyTrackerTelemetry {
+            inner: self.telemetry.clone(),
+        }
     }
 }
 
@@ -83,6 +98,38 @@ where
     connect_erased_provider(provider.erased(), config).await
 }
 
+#[derive(Clone)]
+pub struct AlloyTrackerTelemetry {
+    inner: Arc<RuntimeTelemetry>,
+}
+
+impl AlloyTrackerTelemetry {
+    pub fn snapshot(&self) -> AlloyTrackerTelemetrySnapshot {
+        AlloyTrackerTelemetrySnapshot {
+            pending_seen: self.inner.pending_seen.load(Ordering::Relaxed),
+            block_count: self.inner.block_count.load(Ordering::Relaxed),
+            last_block_txs: self.inner.last_block_txs.load(Ordering::Relaxed),
+            last_block_gas_used: self.inner.last_block_gas_used.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlloyTrackerTelemetrySnapshot {
+    pub pending_seen: u64,
+    pub block_count: u64,
+    pub last_block_txs: usize,
+    pub last_block_gas_used: u64,
+}
+
+#[derive(Default)]
+struct RuntimeTelemetry {
+    pending_seen: AtomicU64,
+    block_count: AtomicU64,
+    last_block_txs: AtomicUsize,
+    last_block_gas_used: AtomicU64,
+}
+
 fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -93,6 +140,7 @@ async fn connect_erased_provider(
 ) -> Result<AlloyTrackerRuntime, AlloyTrackerError> {
     install_rustls_provider();
     let (event_tx, event_rx) = mpsc::channel();
+    let telemetry = Arc::new(RuntimeTelemetry::default());
     let block_sub = timeout(SUBSCRIPTION_TIMEOUT, provider.subscribe_blocks())
         .await
         .map_err(|_| AlloyTrackerError::Timeout {
@@ -111,10 +159,16 @@ async fn connect_erased_provider(
     let block_task = tokio::spawn(run_block_subscription(
         provider.clone(),
         event_tx.clone(),
+        telemetry.clone(),
         shutdown_rx.clone(),
         block_sub,
     ));
-    let pending_task = tokio::spawn(run_pending_subscription(event_tx, shutdown_rx, pending_sub));
+    let pending_task = tokio::spawn(run_pending_subscription(
+        event_tx,
+        telemetry.clone(),
+        shutdown_rx,
+        pending_sub,
+    ));
 
     let initial_txs = backfill_mempool(&provider).await?;
 
@@ -123,6 +177,7 @@ async fn connect_erased_provider(
 
     Ok(AlloyTrackerRuntime {
         handle,
+        telemetry,
         shutdown: shutdown_tx,
         tasks: vec![block_task, pending_task],
     })
@@ -160,6 +215,7 @@ async fn backfill_mempool(provider: &DynProvider) -> Result<Vec<PendingTx>, Allo
 async fn run_block_subscription(
     provider: DynProvider,
     event_tx: mpsc::Sender<MempoolEvent>,
+    telemetry: Arc<RuntimeTelemetry>,
     mut shutdown: watch::Receiver<bool>,
     block_sub: Subscription<alloy::rpc::types::Header>,
 ) {
@@ -197,6 +253,14 @@ async fn run_block_subscription(
                     gas_limit: block.header().gas_limit(),
                 };
 
+                telemetry.block_count.fetch_add(1, Ordering::Relaxed);
+                telemetry
+                    .last_block_txs
+                    .store(block_update.included_txs.len(), Ordering::Relaxed);
+                telemetry
+                    .last_block_gas_used
+                    .store(block_update.gas_used, Ordering::Relaxed);
+
                 if event_tx.send(MempoolEvent::NewBlock(block_update)).is_err() {
                     break;
                 }
@@ -207,6 +271,7 @@ async fn run_block_subscription(
 
 async fn run_pending_subscription(
     event_tx: mpsc::Sender<MempoolEvent>,
+    telemetry: Arc<RuntimeTelemetry>,
     mut shutdown: watch::Receiver<bool>,
     pending_sub: Subscription<RpcTransaction>,
 ) {
@@ -219,6 +284,7 @@ async fn run_pending_subscription(
                 let Some(tx) = maybe_tx else {
                     break;
                 };
+                telemetry.pending_seen.fetch_add(1, Ordering::Relaxed);
 
                 if event_tx
                     .send(MempoolEvent::PendingTransaction(alloy_tx_to_pending_tx(tx)))

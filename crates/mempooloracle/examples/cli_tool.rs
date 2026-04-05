@@ -1,8 +1,8 @@
 use alloy::providers::{ProviderBuilder, WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
-    Address, AlloyTrackerRuntime, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker,
-    PendingTx, TrackerConfig, TxId,
+    Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
+    BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, PendingTx, TrackerConfig, TxId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -29,7 +29,6 @@ async fn main() -> io::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = parse_args();
     let stop = Arc::new(AtomicBool::new(false));
-    let telemetry = Arc::new(Mutex::new(Telemetry::default()));
     let config = TrackerConfig {
         initial_base_fee: 10,
         global_capacity: 1000,
@@ -37,9 +36,9 @@ async fn main() -> io::Result<()> {
         private_flow_prior: 0.1,
     };
 
-    let runtime = match args.source {
-        DataSource::Live { ws_url } => Runtime::Live(
-            MempoolTracker::connect_with_builder(
+    let (runtime, telemetry) = match args.source {
+        DataSource::Live { ws_url } => {
+            let runtime = MempoolTracker::connect_with_builder(
                 ProviderBuilder::default(),
                 WsConnect::new(ws_url).with_config(
                     WebSocketConfig::default()
@@ -49,9 +48,13 @@ async fn main() -> io::Result<()> {
                 config,
             )
             .await
-            .map_err(|err| io::Error::other(format!("failed to connect mempool oracle: {err}")))?,
-        ),
+            .map_err(|err| io::Error::other(format!("failed to connect mempool oracle: {err}")))?;
+
+            let telemetry = TelemetrySource::Live(runtime.telemetry());
+            (Runtime::Live(runtime), telemetry)
+        }
         DataSource::Simulated => {
+            let telemetry = Arc::new(Mutex::new(Telemetry::default()));
             let (event_sender, event_receiver) = mpsc::channel();
             let (handle, tracker) = MempoolTracker::new(event_receiver, &[], config);
             let tracker_thread = thread::spawn(move || tracker.run());
@@ -62,11 +65,14 @@ async fn main() -> io::Result<()> {
                 simulate_blockchain(event_sender, simulation_stop, telemetry_clone)
             });
 
-            Runtime::Simulated {
-                handle,
-                simulation_thread,
-                tracker_thread,
-            }
+            (
+                Runtime::Simulated {
+                    handle,
+                    simulation_thread,
+                    tracker_thread,
+                },
+                TelemetrySource::Simulated(telemetry),
+            )
         }
     };
 
@@ -135,12 +141,31 @@ enum DataSource {
     Simulated,
 }
 
+enum TelemetrySource {
+    Live(AlloyTrackerTelemetry),
+    Simulated(Arc<Mutex<Telemetry>>),
+}
+
+impl TelemetrySource {
+    fn snapshot(&self) -> AlloyTelemetryView {
+        match self {
+            Self::Live(telemetry) => AlloyTelemetryView::from(telemetry.snapshot()),
+            Self::Simulated(telemetry) => AlloyTelemetryView::from(
+                telemetry
+                    .lock()
+                    .expect("telemetry lock poisoned")
+                    .clone(),
+            ),
+        }
+    }
+}
+
 fn run_app(
     mut terminal: DefaultTerminal,
     handle: MempoolHandle,
     duration_secs: u64,
     stop: Arc<AtomicBool>,
-    telemetry: Arc<Mutex<Telemetry>>,
+    telemetry: TelemetrySource,
 ) -> io::Result<()> {
     let started_at = Instant::now();
     let deadline = (duration_secs > 0).then(|| started_at + Duration::from_secs(duration_secs));
@@ -191,7 +216,7 @@ fn run_plaintext(
     handle: MempoolHandle,
     duration_secs: u64,
     stop: Arc<AtomicBool>,
-    telemetry: Arc<Mutex<Telemetry>>,
+    telemetry: TelemetrySource,
 ) -> io::Result<()> {
     let started_at = Instant::now();
     let deadline = (duration_secs > 0).then(|| started_at + Duration::from_secs(duration_secs));
@@ -581,7 +606,7 @@ struct Snapshot {
 impl Snapshot {
     fn capture(
         handle: &MempoolHandle,
-        telemetry: &Arc<Mutex<Telemetry>>,
+        telemetry: &TelemetrySource,
         started_at: Instant,
     ) -> Self {
         let base_fee = handle.current_base_fee();
@@ -627,7 +652,7 @@ impl Snapshot {
             gas_used.saturating_mul(100) / usable_capacity
         };
 
-        let telemetry = telemetry.lock().expect("telemetry lock poisoned").clone();
+        let telemetry = telemetry.snapshot();
 
         Self {
             elapsed_secs: started_at.elapsed().as_secs(),
@@ -667,6 +692,36 @@ struct Telemetry {
     block_count: u64,
     last_block_txs: usize,
     last_block_gas_used: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AlloyTelemetryView {
+    pending_seen: u64,
+    block_count: u64,
+    last_block_txs: usize,
+    last_block_gas_used: u64,
+}
+
+impl From<Telemetry> for AlloyTelemetryView {
+    fn from(value: Telemetry) -> Self {
+        Self {
+            pending_seen: value.pending_seen,
+            block_count: value.block_count,
+            last_block_txs: value.last_block_txs,
+            last_block_gas_used: value.last_block_gas_used,
+        }
+    }
+}
+
+impl From<AlloyTrackerTelemetrySnapshot> for AlloyTelemetryView {
+    fn from(value: AlloyTrackerTelemetrySnapshot) -> Self {
+        Self {
+            pending_seen: value.pending_seen,
+            block_count: value.block_count,
+            last_block_txs: value.last_block_txs,
+            last_block_gas_used: value.last_block_gas_used,
+        }
+    }
 }
 
 fn parse_args() -> CliArgs {

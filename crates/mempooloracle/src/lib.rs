@@ -6,7 +6,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock, mpsc::Receiver};
 
-pub use alloy_support::{AlloyTrackerError, AlloyTrackerRuntime};
+pub use alloy_support::{
+    AlloyTrackerError, AlloyTrackerRuntime, AlloyTrackerTelemetry,
+    AlloyTrackerTelemetrySnapshot,
+};
 
 /// A unique identifier for a transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
