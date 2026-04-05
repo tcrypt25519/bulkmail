@@ -164,22 +164,25 @@ async fn connect_erased_provider(
         block_sub,
     ));
     let pending_task = tokio::spawn(run_pending_subscription(
-        event_tx,
+        event_tx.clone(),
         telemetry.clone(),
-        shutdown_rx,
+        shutdown_rx.clone(),
         pending_sub,
     ));
 
-    let initial_txs = backfill_mempool(&provider).await?;
-
-    let (handle, tracker) = MempoolTracker::from_channel(event_rx, &initial_txs, config);
+    let (handle, tracker) = MempoolTracker::from_channel(event_rx, &[], config);
     thread::spawn(move || tracker.run());
+    let backfill_task = tokio::spawn(run_backfill(
+        provider,
+        event_tx,
+        shutdown_rx,
+    ));
 
     Ok(AlloyTrackerRuntime {
         handle,
         telemetry,
         shutdown: shutdown_tx,
-        tasks: vec![block_task, pending_task],
+        tasks: vec![block_task, pending_task, backfill_task],
     })
 }
 
@@ -210,6 +213,30 @@ async fn backfill_mempool(provider: &DynProvider) -> Result<Vec<PendingTx>, Allo
         .flat_map(HashMap::into_values)
         .map(alloy_tx_to_pending_tx)
         .collect())
+}
+
+async fn run_backfill(
+    provider: DynProvider,
+    event_tx: mpsc::Sender<MempoolEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::select! {
+        _ = shutdown.changed() => {}
+        result = backfill_mempool(&provider) => {
+            let Ok(txs) = result else {
+                return;
+            };
+
+            for tx in txs {
+                if shutdown.has_changed().unwrap_or(false) {
+                    break;
+                }
+                if event_tx.send(MempoolEvent::PendingTransaction(tx)).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn run_block_subscription(
