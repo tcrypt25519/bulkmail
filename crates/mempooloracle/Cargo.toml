@@ -8,7 +8,9 @@ description = "Mempool tracking and confirmation-latency oracle for EIP-1559"
 
 [dependencies]
 alloy.workspace = true
+crossterm.workspace = true
 futures.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

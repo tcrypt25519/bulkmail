@@ -1,11 +1,21 @@
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, PendingTx, TrackerConfig,
     TxId,
 };
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
+};
 use std::{
-    env, process,
+    env, io,
+    io::IsTerminal,
+    process,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -13,9 +23,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn main() {
+fn main() -> io::Result<()> {
     let duration_secs = parse_duration_secs();
     let stop = Arc::new(AtomicBool::new(false));
+    let telemetry = Arc::new(Mutex::new(Telemetry::default()));
 
     let (handle, event_sender, tracker_thread) = {
         let (event_sender, event_receiver) = mpsc::channel();
@@ -32,22 +43,471 @@ fn main() {
 
     let simulation_stop = stop.clone();
     let event_sender_clone = event_sender.clone();
-    let simulation_thread =
-        thread::spawn(move || simulate_blockchain(event_sender_clone, simulation_stop));
+    let telemetry_clone = telemetry.clone();
+    let simulation_thread = thread::spawn(move || {
+        simulate_blockchain(event_sender_clone, simulation_stop, telemetry_clone)
+    });
 
-    if duration_secs == 0 {
-        display_stats(handle, None, stop);
+    let result = if io::stdout().is_terminal() {
+        let terminal = ratatui::init();
+        let result = run_app(terminal, handle, duration_secs, stop.clone(), telemetry);
+        ratatui::restore();
+        result
     } else {
-        display_stats(
-            handle,
-            Some(Instant::now() + Duration::from_secs(duration_secs)),
-            stop.clone(),
-        );
-        stop.store(true, Ordering::Relaxed);
-        drop(event_sender);
-        let _ = simulation_thread.join();
-        let _ = tracker_thread.join();
+        run_plaintext(handle, duration_secs, stop.clone(), telemetry)
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    drop(event_sender);
+    let _ = simulation_thread.join();
+    let _ = tracker_thread.join();
+
+    result
+}
+
+fn run_app(
+    mut terminal: DefaultTerminal,
+    handle: MempoolHandle,
+    duration_secs: u64,
+    stop: Arc<AtomicBool>,
+    telemetry: Arc<Mutex<Telemetry>>,
+) -> io::Result<()> {
+    let started_at = Instant::now();
+    let deadline = (duration_secs > 0).then(|| started_at + Duration::from_secs(duration_secs));
+    let mut app = App::new(duration_secs);
+
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            break;
+        }
+
+        let snapshot = Snapshot::capture(&handle, &telemetry, started_at);
+        app.push_snapshot(snapshot);
+        terminal.draw(|frame| render(frame, &app))?;
+
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                break;
+            }
+        }
     }
+
+    Ok(())
+}
+
+fn run_plaintext(
+    handle: MempoolHandle,
+    duration_secs: u64,
+    stop: Arc<AtomicBool>,
+    telemetry: Arc<Mutex<Telemetry>>,
+) -> io::Result<()> {
+    let started_at = Instant::now();
+    let deadline = (duration_secs > 0).then(|| started_at + Duration::from_secs(duration_secs));
+    let mut last_render = Instant::now() - Duration::from_secs(1);
+
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            break;
+        }
+
+        if last_render.elapsed() >= Duration::from_millis(500) {
+            let snapshot = Snapshot::capture(&handle, &telemetry, started_at);
+            println!(
+                "base_fee={} min_tip={} expected_txs={} private_flow={:.1}% blocks={} pending_seen={}",
+                snapshot.base_fee,
+                snapshot.min_tip,
+                snapshot.expected_txs,
+                snapshot.private_flow,
+                snapshot.block_count,
+                snapshot.pending_seen
+            );
+            last_render = Instant::now();
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(())
+}
+
+fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Min(12),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    render_header(frame, outer[0], app);
+    render_gauges(frame, outer[1], app);
+    render_body(frame, outer[2], app);
+    render_footer(frame, outer[3], app);
+}
+
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let snapshot = app.latest();
+    let mode = if app.duration_secs == 0 {
+        "live until Ctrl-C"
+    } else {
+        "timed capture"
+    };
+    let text = Line::from(vec![
+        Span::styled(
+            "Mempool Oracle",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(mode, Style::default().fg(Color::Yellow)),
+        Span::raw("  "),
+        Span::styled(
+            format!("uptime {}s", snapshot.elapsed_secs),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("blocks {}", snapshot.block_count),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("pending seen {}", snapshot.pending_seen),
+            Style::default().fg(Color::Magenta),
+        ),
+    ]);
+
+    let header =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Overview"));
+    frame.render_widget(header, area);
+}
+
+fn render_gauges(frame: &mut Frame, area: Rect, app: &App) {
+    let snapshot = app.latest();
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+
+    let private_flow = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Private Flow"))
+        .gauge_style(Style::default().fg(Color::LightYellow))
+        .percent(snapshot.private_flow_percent.min(100) as u16)
+        .label(format!("{:.1}%", snapshot.private_flow));
+    frame.render_widget(private_flow, chunks[0]);
+
+    let next_block_fill = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Next Block Fill"),
+        )
+        .gauge_style(Style::default().fg(Color::LightGreen))
+        .percent(snapshot.next_block_fill_percent.min(100) as u16)
+        .label(format!("{:.1}%", snapshot.next_block_fill_percent));
+    frame.render_widget(next_block_fill, chunks[1]);
+
+    let marketable = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Marketable Set"),
+        )
+        .gauge_style(Style::default().fg(Color::LightBlue))
+        .percent(snapshot.marketable_utilization.min(100) as u16)
+        .label(format!("{} tracked", snapshot.marketable_count));
+    frame.render_widget(marketable, chunks[2]);
+}
+
+fn render_body(frame: &mut Frame, area: Rect, app: &App) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+
+    render_metrics(frame, columns[0], app);
+    render_base_fee_chart(frame, columns[1], app);
+    render_top_transactions(frame, columns[2], app);
+}
+
+fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
+    let snapshot = app.latest();
+    let lines = vec![
+        Line::from(vec![
+            "Base fee: ".into(),
+            format!("{}", snapshot.base_fee).cyan().bold(),
+        ]),
+        Line::from(vec![
+            "Min tip next block: ".into(),
+            format!("{}", snapshot.min_tip).green().bold(),
+        ]),
+        Line::from(vec![
+            "Expected txs next block: ".into(),
+            format!("{}", snapshot.expected_txs).yellow().bold(),
+        ]),
+        Line::from(vec![
+            "Gas in next block set: ".into(),
+            format!("{}", snapshot.gas_used_for_next_block).into(),
+        ]),
+        Line::from(vec![
+            "Usable capacity: ".into(),
+            format!("{}", snapshot.usable_capacity).into(),
+        ]),
+        Line::from(vec![
+            "Last block gas used: ".into(),
+            format!("{}", snapshot.last_block_gas_used).into(),
+        ]),
+        Line::from(vec![
+            "Last block txs: ".into(),
+            format!("{}", snapshot.last_block_txs).into(),
+        ]),
+        Line::from(vec![
+            "Tracker queue depth: ".into(),
+            format!("{}", snapshot.marketable_count).into(),
+        ]),
+    ];
+
+    let metrics = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Live Metrics"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(metrics, area);
+}
+
+fn render_base_fee_chart(frame: &mut Frame, area: Rect, app: &App) {
+    let bars: Vec<Bar> = app
+        .snapshots
+        .iter()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .enumerate()
+        .map(|(index, snapshot)| {
+            Bar::default()
+                .value(snapshot.base_fee.min(u64::MAX as u128) as u64)
+                .label(format!("{}", index + 1).into())
+                .style(Style::default().fg(Color::Cyan))
+        })
+        .collect();
+
+    let group = BarGroup::default().bars(&bars);
+    let chart = BarChart::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Recent Base Fee"),
+        )
+        .data(group)
+        .bar_width(4)
+        .bar_gap(1)
+        .value_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+
+    frame.render_widget(chart, area);
+}
+
+fn render_top_transactions(frame: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = if app.latest().top_rows.is_empty() {
+        vec![ListItem::new("No marketable transactions yet.")]
+    } else {
+        app.latest()
+            .top_rows
+            .iter()
+            .map(|row| {
+                ListItem::new(vec![
+                    Line::from(format!(
+                        "nonce {:>3}  tip {:>3}  max {:>3}",
+                        row.nonce, row.priority_fee, row.max_fee
+                    )),
+                    Line::from(format!(
+                        "gas {:>6}  eta {} blk  sender {:02x}{:02x}..",
+                        row.gas_limit, row.eta_blocks, row.sender_prefix.0, row.sender_prefix.1
+                    ))
+                    .style(Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Top Pending Transactions"),
+    );
+    frame.render_widget(list, area);
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let text = if app.duration_secs == 0 {
+        "Ctrl-C, q, or Esc to quit. The dashboard updates every 100ms."
+    } else {
+        "Timed run active. Ctrl-C, q, or Esc exits early."
+    };
+    let footer = Paragraph::new(text)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(footer, area);
+}
+
+struct App {
+    duration_secs: u64,
+    snapshots: Vec<Snapshot>,
+}
+
+impl App {
+    fn new(duration_secs: u64) -> Self {
+        Self {
+            duration_secs,
+            snapshots: Vec::new(),
+        }
+    }
+
+    fn push_snapshot(&mut self, snapshot: Snapshot) {
+        self.snapshots.push(snapshot);
+        if self.snapshots.len() > 60 {
+            let overflow = self.snapshots.len() - 60;
+            self.snapshots.drain(0..overflow);
+        }
+    }
+
+    fn latest(&self) -> &Snapshot {
+        self.snapshots
+            .last()
+            .expect("app should always contain at least one snapshot")
+    }
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    elapsed_secs: u64,
+    base_fee: u128,
+    private_flow: f64,
+    private_flow_percent: u64,
+    min_tip: u128,
+    expected_txs: usize,
+    gas_used_for_next_block: u64,
+    usable_capacity: u64,
+    next_block_fill_percent: u64,
+    marketable_count: usize,
+    marketable_utilization: u64,
+    block_count: u64,
+    pending_seen: u64,
+    last_block_txs: usize,
+    last_block_gas_used: u64,
+    top_rows: Vec<TxRow>,
+}
+
+impl Snapshot {
+    fn capture(
+        handle: &MempoolHandle,
+        telemetry: &Arc<Mutex<Telemetry>>,
+        started_at: Instant,
+    ) -> Self {
+        let base_fee = handle.current_base_fee();
+        let private_flow = handle.private_flow_ratio() * 100.0;
+        let last_block_gas_limit = handle.last_block_gas_limit();
+        let usable_capacity =
+            (last_block_gas_limit as f64 * (1.0 - handle.private_flow_ratio())) as u64;
+        let pq = handle.priority_queue();
+
+        let mut expected_txs = 0usize;
+        let mut min_tip = 0u128;
+        let mut gas_used = 0u64;
+        let mut top_rows = Vec::new();
+
+        for (fee, addr, nonce) in pq.iter().rev() {
+            if let Some(tx) = handle.find_tx_by_addr_and_nonce(*addr, *nonce) {
+                if top_rows.len() < 8 {
+                    let eta_blocks = handle.estimated_blocks_to_confirm(&tx.id).unwrap_or(0);
+                    top_rows.push(TxRow {
+                        nonce: tx.nonce,
+                        priority_fee: tx.max_priority_fee_per_gas,
+                        max_fee: tx.max_fee_per_gas,
+                        gas_limit: tx.gas_limit,
+                        eta_blocks,
+                        sender_prefix: (tx.sender.0[0], tx.sender.0[1]),
+                    });
+                }
+
+                if gas_used + tx.gas_limit > usable_capacity {
+                    continue;
+                }
+
+                gas_used += tx.gas_limit;
+                min_tip = *fee;
+                expected_txs += 1;
+            }
+        }
+
+        let next_block_fill_percent = if usable_capacity == 0 {
+            0
+        } else {
+            gas_used.saturating_mul(100) / usable_capacity
+        };
+
+        let telemetry = telemetry.lock().expect("telemetry lock poisoned").clone();
+
+        Self {
+            elapsed_secs: started_at.elapsed().as_secs(),
+            base_fee,
+            private_flow,
+            private_flow_percent: private_flow.round() as u64,
+            min_tip,
+            expected_txs,
+            gas_used_for_next_block: gas_used,
+            usable_capacity,
+            next_block_fill_percent,
+            marketable_count: pq.len(),
+            marketable_utilization: (pq.len().min(1000) as u64 * 100) / 1000,
+            block_count: telemetry.block_count,
+            pending_seen: telemetry.pending_seen,
+            last_block_txs: telemetry.last_block_txs,
+            last_block_gas_used: telemetry.last_block_gas_used,
+            top_rows,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TxRow {
+    nonce: u64,
+    priority_fee: u128,
+    max_fee: u128,
+    gas_limit: u64,
+    eta_blocks: u64,
+    sender_prefix: (u8, u8),
+}
+
+#[derive(Clone, Default)]
+struct Telemetry {
+    pending_seen: u64,
+    block_count: u64,
+    last_block_txs: usize,
+    last_block_gas_used: u64,
 }
 
 fn parse_duration_secs() -> u64 {
@@ -93,7 +553,11 @@ fn print_usage_and_exit() -> ! {
     process::exit(2);
 }
 
-fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>, stop: Arc<AtomicBool>) {
+fn simulate_blockchain(
+    events: mpsc::Sender<MempoolEvent>,
+    stop: Arc<AtomicBool>,
+    telemetry: Arc<Mutex<Telemetry>>,
+) {
     let mut nonce = 0;
     let sender = Address([1; 20]);
     let mut block_number = 0;
@@ -115,6 +579,10 @@ fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>, stop: Arc<AtomicBool>
             if events.send(MempoolEvent::PendingTransaction(tx)).is_err() {
                 return;
             }
+            telemetry
+                .lock()
+                .expect("telemetry lock poisoned")
+                .pending_seen += 1;
             nonce += 1;
         }
 
@@ -137,72 +605,24 @@ fn simulate_blockchain(events: mpsc::Sender<MempoolEvent>, stop: Arc<AtomicBool>
             })
             .collect();
 
+        {
+            let mut telemetry = telemetry.lock().expect("telemetry lock poisoned");
+            telemetry.block_count = block_number + 1;
+            telemetry.last_block_txs = included_txs.len();
+            telemetry.last_block_gas_used = 21000 * block_tx_count;
+        }
+
         let block = BlockUpdate {
-            included_txs: included_txs.clone(),
-            new_base_fee: 10 + (block_number % 5),
+            included_txs,
+            new_base_fee: 10 + (block_number % 5) as u128,
             gas_used: 21000 * block_tx_count,
             gas_limit: 30_000_000,
         };
-
-        println!(
-            "
---- New Block {} ({} txs) ---",
-            block_number,
-            block.included_txs.len()
-        );
 
         if events.send(MempoolEvent::NewBlock(block)).is_err() {
             return;
         }
         block_number += 1;
-    }
-}
-
-fn display_stats(handle: MempoolHandle, deadline: Option<Instant>, stop: Arc<AtomicBool>) {
-    let mut last_run = Instant::now();
-
-    loop {
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
-            return;
-        }
-
-        if last_run.elapsed() >= Duration::from_secs(2) {
-            let base_fee = handle.current_base_fee();
-            let private_flow = handle.private_flow_ratio();
-            let last_block_gas_limit = handle.last_block_gas_limit();
-            let usable_capacity = (last_block_gas_limit as f64 * (1.0 - private_flow)) as u64;
-
-            let mut expected_txs = 0;
-            let mut min_tip = 0;
-            let mut gas_used = 0;
-
-            let pq = handle.priority_queue();
-
-            for (fee, addr, nonce) in pq.iter().rev() {
-                if let Some(tx) = handle.find_tx_by_addr_and_nonce(*addr, *nonce) {
-                    if gas_used + tx.gas_limit > usable_capacity {
-                        break;
-                    }
-                    gas_used += tx.gas_limit;
-                    min_tip = *fee;
-                    expected_txs += 1;
-                }
-            }
-
-            println!(
-                "Current Base Fee: {} | Min Tip (next block): {} | Expected Txs (next block): {}",
-                base_fee, min_tip, expected_txs
-            );
-
-            last_run = Instant::now();
-        }
-
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
     }
 }
 
