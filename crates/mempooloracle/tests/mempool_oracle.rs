@@ -22,6 +22,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_p2p_transport_requires_feature() {
+        let result = MempoolTracker::connect(
+            TrackerTransport::P2p(P2pTransportConfig {
+                chain: "mainnet".to_owned(),
+                bootnodes: vec![],
+                discovery_v4: true,
+                listen_addr: None,
+            }),
+            default_config(),
+        )
+        .await;
+
+        assert!(result.is_err(), "p2p transport should be gated");
+        let err = result.err().unwrap();
+
+        assert!(matches!(
+            err,
+            TrackerError::FeatureDisabled("reth-p2p") | TrackerError::UnsupportedTransport(_)
+        ));
+    }
+
     #[test]
     fn test_classification_marketable() {
         let tx = PendingTx {
@@ -214,7 +236,10 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        assert_eq!(handle.classification(&tx_low.id), Some(TxClassification::Marketable));
+        assert_eq!(
+            handle.classification(&tx_low.id),
+            Some(TxClassification::Marketable)
+        );
         assert_eq!(
             handle.classification(&tx_high.id),
             Some(TxClassification::Marketable)

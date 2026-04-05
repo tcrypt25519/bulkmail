@@ -1,15 +1,51 @@
 //! A tracker for EIP-1559 mempool state and transaction confirmation latency.
-mod alloy_support;
+mod runtime;
+mod transport;
 
 use alloy::providers::fillers::TxFiller;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock, mpsc::Receiver};
 
-pub use alloy_support::{
-    AlloyTrackerError, AlloyTrackerRuntime, AlloyTrackerTelemetry,
-    AlloyTrackerTelemetrySnapshot,
-};
+pub use runtime::{TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind};
+use transport::{p2p, rpc};
+
+pub type AlloyTrackerRuntime = TrackerRuntime;
+pub type AlloyTrackerTelemetry = TrackerTelemetry;
+pub type AlloyTrackerTelemetrySnapshot = TrackerTelemetrySnapshot;
+
+#[derive(Clone, Debug)]
+pub enum TrackerTransport {
+    Rpc(RpcTransportConfig),
+    P2p(P2pTransportConfig),
+}
+
+#[derive(Clone, Debug)]
+pub struct RpcTransportConfig {
+    pub ws: alloy::providers::WsConnect,
+}
+
+#[derive(Clone, Debug)]
+pub struct P2pTransportConfig {
+    pub chain: String,
+    pub bootnodes: Vec<String>,
+    pub discovery_v4: bool,
+    pub listen_addr: Option<std::net::SocketAddr>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrackerError {
+    #[error("alloy transport error: {0}")]
+    Transport(#[from] alloy::transports::TransportError),
+    #[error("timed out during {stage}")]
+    Timeout { stage: &'static str },
+    #[error("feature `{0}` is not enabled")]
+    FeatureDisabled(&'static str),
+    #[error("transport unsupported: {0}")]
+    UnsupportedTransport(&'static str),
+}
+
+pub type AlloyTrackerError = TrackerError;
 
 /// A unique identifier for a transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -88,6 +124,17 @@ pub struct MempoolTracker {
 }
 
 impl MempoolTracker {
+    /// Creates a tracker runtime from a selected transport.
+    pub async fn connect(
+        transport: TrackerTransport,
+        config: TrackerConfig,
+    ) -> Result<TrackerRuntime, TrackerError> {
+        match transport {
+            TrackerTransport::Rpc(rpc_config) => rpc::connect_with_config(rpc_config, config).await,
+            TrackerTransport::P2p(p2p_config) => p2p::connect_with_config(p2p_config, config).await,
+        }
+    }
+
     /// Creates a new event-driven mempool tracker and its handle from a channel.
     pub fn from_channel(
         rx: Receiver<MempoolEvent>,
@@ -136,7 +183,7 @@ impl MempoolTracker {
         builder: alloy::providers::ProviderBuilder<L, F>,
         ws: alloy::providers::WsConnect,
         config: TrackerConfig,
-    ) -> Result<AlloyTrackerRuntime, AlloyTrackerError>
+    ) -> Result<TrackerRuntime, TrackerError>
     where
         L: alloy::providers::ProviderLayer<
                 alloy::providers::RootProvider,
@@ -146,18 +193,18 @@ impl MempoolTracker {
             + alloy::providers::ProviderLayer<L::Provider, alloy::network::Ethereum>,
         F::Provider: 'static,
     {
-        alloy_support::connect_with_builder(builder, ws, config).await
+        rpc::connect_with_builder(builder, ws, config).await
     }
 
     /// Creates a tracker runtime from an existing Alloy pubsub-capable provider.
     pub async fn connect_with_provider<P>(
         provider: P,
         config: TrackerConfig,
-    ) -> Result<AlloyTrackerRuntime, AlloyTrackerError>
+    ) -> Result<TrackerRuntime, TrackerError>
     where
         P: alloy::providers::Provider<alloy::network::Ethereum> + 'static,
     {
-        alloy_support::connect_with_provider(provider, config).await
+        rpc::connect_with_provider(provider, config).await
     }
 
     /// Runs the tracker's event loop.

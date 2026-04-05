@@ -1,8 +1,9 @@
-use alloy::providers::{ProviderBuilder, WebSocketConfig, WsConnect};
+use alloy::providers::{WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
-    BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, PendingTx, TrackerConfig, TxId,
+    BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, P2pTransportConfig, PendingTx,
+    TrackerConfig, TrackerTransport, TxId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -38,17 +39,40 @@ async fn main() -> io::Result<()> {
 
     let (runtime, telemetry) = match args.source {
         DataSource::Live { ws_url } => {
-            let runtime = MempoolTracker::connect_with_builder(
-                ProviderBuilder::default(),
-                WsConnect::new(ws_url).with_config(
+            let transport = TrackerTransport::Rpc(mempooloracle::RpcTransportConfig {
+                ws: WsConnect::new(ws_url).with_config(
                     WebSocketConfig::default()
                         .max_message_size(Some(128 << 20))
                         .max_frame_size(Some(128 << 20)),
                 ),
-                config,
-            )
-            .await
-            .map_err(|err| io::Error::other(format!("failed to connect mempool oracle: {err}")))?;
+            });
+            let runtime = MempoolTracker::connect(transport, config.clone())
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!("failed to connect mempool oracle: {err}"))
+                })?;
+
+            let telemetry = TelemetrySource::Live(runtime.telemetry());
+            (Runtime::Live(runtime), telemetry)
+        }
+        DataSource::P2p {
+            chain,
+            bootnodes,
+            discovery_v4,
+        } => {
+            let transport = TrackerTransport::P2p(P2pTransportConfig {
+                chain,
+                bootnodes,
+                discovery_v4,
+                listen_addr: None,
+            });
+            let runtime = MempoolTracker::connect(transport, config.clone())
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to connect mempool oracle p2p transport: {err}"
+                    ))
+                })?;
 
             let telemetry = TelemetrySource::Live(runtime.telemetry());
             (Runtime::Live(runtime), telemetry)
@@ -137,7 +161,14 @@ struct CliArgs {
 }
 
 enum DataSource {
-    Live { ws_url: String },
+    Live {
+        ws_url: String,
+    },
+    P2p {
+        chain: String,
+        bootnodes: Vec<String>,
+        discovery_v4: bool,
+    },
     Simulated,
 }
 
@@ -150,12 +181,9 @@ impl TelemetrySource {
     fn snapshot(&self) -> AlloyTelemetryView {
         match self {
             Self::Live(telemetry) => AlloyTelemetryView::from(telemetry.snapshot()),
-            Self::Simulated(telemetry) => AlloyTelemetryView::from(
-                telemetry
-                    .lock()
-                    .expect("telemetry lock poisoned")
-                    .clone(),
-            ),
+            Self::Simulated(telemetry) => {
+                AlloyTelemetryView::from(telemetry.lock().expect("telemetry lock poisoned").clone())
+            }
         }
     }
 }
@@ -604,11 +632,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn capture(
-        handle: &MempoolHandle,
-        telemetry: &TelemetrySource,
-        started_at: Instant,
-    ) -> Self {
+    fn capture(handle: &MempoolHandle, telemetry: &TelemetrySource, started_at: Instant) -> Self {
         let base_fee = handle.current_base_fee();
         let private_flow = handle.private_flow_ratio() * 100.0;
         let last_block_gas_limit = handle.last_block_gas_limit();
@@ -731,6 +755,10 @@ fn parse_args() -> CliArgs {
         .ok()
         .or_else(|| env::var("ETH_WS_URL").ok());
     let mut simulate = false;
+    let mut p2p = false;
+    let mut chain = String::from("mainnet");
+    let mut bootnodes = Vec::new();
+    let mut discovery_v4 = true;
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--duration=") {
@@ -766,19 +794,66 @@ fn parse_args() -> CliArgs {
             continue;
         }
 
+        if arg == "--p2p" {
+            p2p = true;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--chain=") {
+            chain = value.to_owned();
+            continue;
+        }
+
+        if arg == "--chain" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --chain");
+                print_usage_and_exit();
+            };
+            chain = value;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--bootnode=") {
+            bootnodes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--bootnode" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --bootnode");
+                print_usage_and_exit();
+            };
+            bootnodes.push(value);
+            continue;
+        }
+
+        if arg == "--disable-discovery-v4" {
+            discovery_v4 = false;
+            continue;
+        }
+
         eprintln!("unrecognized argument: {arg}");
         print_usage_and_exit();
     }
 
-    let source = match (simulate, ws_url) {
-        (true, Some(_)) => {
+    let source = match (simulate, p2p, ws_url) {
+        (true, false, Some(_)) => {
             eprintln!("choose either --simulate or --ws-url, not both");
             print_usage_and_exit();
         }
-        (true, None) => DataSource::Simulated,
-        (false, Some(ws_url)) => DataSource::Live { ws_url },
-        (false, None) => {
-            eprintln!("missing data source: provide --ws-url <url> or use --simulate");
+        (true, true, _) | (false, true, Some(_)) => {
+            eprintln!("choose exactly one data source: --simulate, --ws-url, or --p2p");
+            print_usage_and_exit();
+        }
+        (true, false, None) => DataSource::Simulated,
+        (false, true, None) => DataSource::P2p {
+            chain,
+            bootnodes,
+            discovery_v4,
+        },
+        (false, false, Some(ws_url)) => DataSource::Live { ws_url },
+        (false, false, None) => {
+            eprintln!("missing data source: provide --ws-url <url>, use --p2p, or use --simulate");
             print_usage_and_exit();
         }
     };
@@ -801,7 +876,7 @@ fn parse_duration_value(value: &str) -> u64 {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "usage: cargo run -p mempooloracle --example cli_tool -- (--ws-url <url> | --simulate) [--duration <seconds>]"
+        "usage: cargo run -p mempooloracle --example cli_tool -- ((--ws-url <url>) | (--p2p [--chain <name>] [--bootnode <enode>]...) | --simulate) [--duration <seconds>]"
     );
     eprintln!("default: --duration 30");
     eprintln!("use --duration 0 to run until interrupted");
