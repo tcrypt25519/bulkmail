@@ -1,7 +1,8 @@
+use alloy::providers::{ProviderBuilder, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
-    Address, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, PendingTx, TrackerConfig,
-    TxId,
+    Address, AlloyTrackerRuntime, BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker,
+    PendingTx, TrackerConfig, TxId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -23,46 +24,110 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn main() -> io::Result<()> {
-    let duration_secs = parse_duration_secs();
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let args = parse_args();
     let stop = Arc::new(AtomicBool::new(false));
     let telemetry = Arc::new(Mutex::new(Telemetry::default()));
-
-    let (handle, event_sender, tracker_thread) = {
-        let (event_sender, event_receiver) = mpsc::channel();
-        let config = TrackerConfig {
-            initial_base_fee: 10,
-            global_capacity: 1000,
-            per_account_capacity: 100,
-            private_flow_prior: 0.1,
-        };
-        let (handle, tracker) = MempoolTracker::new(event_receiver, &[], config);
-        let tracker_thread = thread::spawn(move || tracker.run());
-        (handle, event_sender, tracker_thread)
+    let config = TrackerConfig {
+        initial_base_fee: 10,
+        global_capacity: 1000,
+        per_account_capacity: 100,
+        private_flow_prior: 0.1,
     };
 
-    let simulation_stop = stop.clone();
-    let event_sender_clone = event_sender.clone();
-    let telemetry_clone = telemetry.clone();
-    let simulation_thread = thread::spawn(move || {
-        simulate_blockchain(event_sender_clone, simulation_stop, telemetry_clone)
-    });
+    let runtime = match args.source {
+        DataSource::Live { ws_url } => Runtime::Live(
+            MempoolTracker::connect_with_builder(
+                ProviderBuilder::default(),
+                WsConnect::new(ws_url),
+                config,
+            )
+            .await
+            .map_err(|err| io::Error::other(format!("failed to connect mempool oracle: {err}")))?,
+        ),
+        DataSource::Simulated => {
+            let (event_sender, event_receiver) = mpsc::channel();
+            let (handle, tracker) = MempoolTracker::new(event_receiver, &[], config);
+            let tracker_thread = thread::spawn(move || tracker.run());
+
+            let simulation_stop = stop.clone();
+            let telemetry_clone = telemetry.clone();
+            let simulation_thread = thread::spawn(move || {
+                simulate_blockchain(event_sender, simulation_stop, telemetry_clone)
+            });
+
+            Runtime::Simulated {
+                handle,
+                simulation_thread,
+                tracker_thread,
+            }
+        }
+    };
+
+    let handle = runtime.handle();
 
     let result = if io::stdout().is_terminal() {
         let terminal = ratatui::init();
-        let result = run_app(terminal, handle, duration_secs, stop.clone(), telemetry);
+        let result = run_app(
+            terminal,
+            handle,
+            args.duration_secs,
+            stop.clone(),
+            telemetry,
+        );
         ratatui::restore();
         result
     } else {
-        run_plaintext(handle, duration_secs, stop.clone(), telemetry)
+        run_plaintext(handle, args.duration_secs, stop.clone(), telemetry)
     };
 
     stop.store(true, Ordering::Relaxed);
-    drop(event_sender);
-    let _ = simulation_thread.join();
-    let _ = tracker_thread.join();
+    runtime.shutdown();
 
     result
+}
+
+enum Runtime {
+    Live(AlloyTrackerRuntime),
+    Simulated {
+        handle: MempoolHandle,
+        simulation_thread: thread::JoinHandle<()>,
+        tracker_thread: thread::JoinHandle<()>,
+    },
+}
+
+impl Runtime {
+    fn handle(&self) -> MempoolHandle {
+        match self {
+            Self::Live(runtime) => runtime.handle(),
+            Self::Simulated { handle, .. } => handle.clone(),
+        }
+    }
+
+    fn shutdown(self) {
+        match self {
+            Self::Live(runtime) => drop(runtime),
+            Self::Simulated {
+                simulation_thread,
+                tracker_thread,
+                ..
+            } => {
+                let _ = simulation_thread.join();
+                let _ = tracker_thread.join();
+            }
+        }
+    }
+}
+
+struct CliArgs {
+    duration_secs: u64,
+    source: DataSource,
+}
+
+enum DataSource {
+    Live { ws_url: String },
+    Simulated,
 }
 
 fn run_app(
@@ -599,9 +664,13 @@ struct Telemetry {
     last_block_gas_used: u64,
 }
 
-fn parse_duration_secs() -> u64 {
+fn parse_args() -> CliArgs {
     let mut args = env::args().skip(1);
     let mut duration_secs = 30_u64;
+    let mut ws_url = env::var("MEMPOOLORACLE_WS_URL")
+        .ok()
+        .or_else(|| env::var("ETH_WS_URL").ok());
+    let mut simulate = false;
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--duration=") {
@@ -618,11 +687,46 @@ fn parse_duration_secs() -> u64 {
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--ws-url=") {
+            ws_url = Some(value.to_owned());
+            continue;
+        }
+
+        if arg == "--ws-url" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --ws-url");
+                print_usage_and_exit();
+            };
+            ws_url = Some(value);
+            continue;
+        }
+
+        if arg == "--simulate" {
+            simulate = true;
+            continue;
+        }
+
         eprintln!("unrecognized argument: {arg}");
         print_usage_and_exit();
     }
 
-    duration_secs
+    let source = match (simulate, ws_url) {
+        (true, Some(_)) => {
+            eprintln!("choose either --simulate or --ws-url, not both");
+            print_usage_and_exit();
+        }
+        (true, None) => DataSource::Simulated,
+        (false, Some(ws_url)) => DataSource::Live { ws_url },
+        (false, None) => {
+            eprintln!("missing data source: provide --ws-url <url> or use --simulate");
+            print_usage_and_exit();
+        }
+    };
+
+    CliArgs {
+        duration_secs,
+        source,
+    }
 }
 
 fn parse_duration_value(value: &str) -> u64 {
@@ -636,9 +740,12 @@ fn parse_duration_value(value: &str) -> u64 {
 }
 
 fn print_usage_and_exit() -> ! {
-    eprintln!("usage: cargo run -p mempooloracle --example cli_tool -- [--duration <seconds>]");
+    eprintln!(
+        "usage: cargo run -p mempooloracle --example cli_tool -- (--ws-url <url> | --simulate) [--duration <seconds>]"
+    );
     eprintln!("default: --duration 30");
     eprintln!("use --duration 0 to run until interrupted");
+    eprintln!("or set MEMPOOLORACLE_WS_URL / ETH_WS_URL instead of passing --ws-url");
     process::exit(2);
 }
 
