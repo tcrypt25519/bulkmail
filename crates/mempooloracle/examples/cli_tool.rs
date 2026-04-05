@@ -85,7 +85,7 @@ fn run_app(
 
         let snapshot = Snapshot::capture(&handle, &telemetry, started_at);
         app.push_snapshot(snapshot);
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
@@ -94,10 +94,22 @@ fn run_app(
                 continue;
             }
 
+            let terminal_size = terminal.size()?;
+            let list_rows =
+                transaction_pane_rows(Rect::new(0, 0, terminal_size.width, terminal_size.height));
+
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 break;
+            }
+
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
+                KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1, list_rows),
+                KeyCode::PageUp => app.scroll_up(list_rows.max(1)),
+                KeyCode::PageDown => app.scroll_down(list_rows.max(1), list_rows),
+                _ => {}
             }
         }
     }
@@ -142,7 +154,7 @@ fn run_plaintext(
     Ok(())
 }
 
-fn render(frame: &mut Frame, app: &App) {
+fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -239,13 +251,13 @@ fn render_gauges(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(marketable, chunks[2]);
 }
 
-fn render_body(frame: &mut Frame, area: Rect, app: &App) {
+fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(45),
         ])
         .split(area);
 
@@ -330,42 +342,63 @@ fn render_base_fee_chart(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(chart, area);
 }
 
-fn render_top_transactions(frame: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = if app.latest().top_rows.is_empty() {
+fn render_top_transactions(frame: &mut Frame, area: Rect, app: &mut App) {
+    let visible_rows = transaction_rows(app.latest(), area.height);
+    app.clamp_scroll(visible_rows);
+
+    let title = if app.latest().ranked_rows.is_empty() {
+        format!(
+            "Ranked Pending Transactions [0 of {}]",
+            app.latest().marketable_count
+        )
+    } else if app.latest().marketable_count > app.latest().ranked_rows.len() {
+        format!(
+            "Ranked Pending Transactions [{}-{} of {} | sampled top {}]",
+            app.tx_scroll + 1,
+            (app.tx_scroll + visible_rows).min(app.latest().ranked_rows.len()),
+            app.latest().marketable_count,
+            app.latest().ranked_rows.len()
+        )
+    } else {
+        format!(
+            "Ranked Pending Transactions [{}-{} of {}]",
+            app.tx_scroll + 1,
+            (app.tx_scroll + visible_rows).min(app.latest().ranked_rows.len()),
+            app.latest().marketable_count
+        )
+    };
+
+    let items: Vec<ListItem> = if app.latest().ranked_rows.is_empty() {
         vec![ListItem::new("No marketable transactions yet.")]
     } else {
         app.latest()
-            .top_rows
+            .ranked_rows
             .iter()
+            .skip(app.tx_scroll)
+            .take(visible_rows)
             .map(|row| {
-                ListItem::new(vec![
-                    Line::from(format!(
-                        "nonce {:>3}  tip {:>3}  max {:>3}",
-                        row.nonce, row.priority_fee, row.max_fee
-                    )),
-                    Line::from(format!(
-                        "gas {:>6}  eta {} blk  sender {:02x}{:02x}..",
-                        row.gas_limit, row.eta_blocks, row.sender_prefix.0, row.sender_prefix.1
-                    ))
-                    .style(Style::default().fg(Color::Gray)),
-                ])
+                ListItem::new(Line::from(vec![
+                    format!("{:>4} ", row.nonce).yellow(),
+                    format!("eff {:>3} ", row.effective_priority_fee).cyan(),
+                    format!("tip {:>3} ", row.priority_fee).green(),
+                    format!("max {:>3} ", row.max_fee).magenta(),
+                    format!("gas {:>6} ", row.gas_limit).into(),
+                    format!("eta {:>2} ", row.eta_blocks).blue(),
+                    format!("{:02x}{:02x}..", row.sender_prefix.0, row.sender_prefix.1).dark_gray(),
+                ]))
             })
             .collect()
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Top Pending Transactions"),
-    );
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.duration_secs == 0 {
-        "Ctrl-C, q, or Esc to quit. The dashboard updates every 100ms."
+        "Up/Down or j/k scroll txs. PgUp/PgDn jump. Ctrl-C, q, or Esc quits."
     } else {
-        "Timed run active. Ctrl-C, q, or Esc exits early."
+        "Timed run active. Up/Down or j/k scroll txs. Ctrl-C, q, or Esc exits early."
     };
     let footer = Paragraph::new(text)
         .style(Style::default().fg(Color::DarkGray))
@@ -373,9 +406,40 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(footer, area);
 }
 
+fn transaction_rows(snapshot: &Snapshot, area_height: u16) -> usize {
+    if snapshot.ranked_rows.is_empty() {
+        1
+    } else {
+        area_height.saturating_sub(2).max(1) as usize
+    }
+}
+
+fn transaction_pane_rows(area: Rect) -> usize {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Min(12),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(45),
+        ])
+        .split(outer[2]);
+
+    columns[2].height.saturating_sub(2).max(1) as usize
+}
+
 struct App {
     duration_secs: u64,
     snapshots: Vec<Snapshot>,
+    tx_scroll: usize,
 }
 
 impl App {
@@ -383,6 +447,7 @@ impl App {
         Self {
             duration_secs,
             snapshots: Vec::new(),
+            tx_scroll: 0,
         }
     }
 
@@ -392,12 +457,34 @@ impl App {
             let overflow = self.snapshots.len() - 60;
             self.snapshots.drain(0..overflow);
         }
+
+        self.clamp_scroll(0);
     }
 
     fn latest(&self) -> &Snapshot {
         self.snapshots
             .last()
             .expect("app should always contain at least one snapshot")
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.tx_scroll = self.tx_scroll.saturating_sub(amount);
+    }
+
+    fn scroll_down(&mut self, amount: usize, visible_rows: usize) {
+        let max_scroll = self.max_scroll(visible_rows);
+        self.tx_scroll = (self.tx_scroll + amount).min(max_scroll);
+    }
+
+    fn clamp_scroll(&mut self, visible_rows: usize) {
+        self.tx_scroll = self.tx_scroll.min(self.max_scroll(visible_rows));
+    }
+
+    fn max_scroll(&self, visible_rows: usize) -> usize {
+        self.latest()
+            .ranked_rows
+            .len()
+            .saturating_sub(visible_rows.max(1))
     }
 }
 
@@ -418,7 +505,7 @@ struct Snapshot {
     pending_seen: u64,
     last_block_txs: usize,
     last_block_gas_used: u64,
-    top_rows: Vec<TxRow>,
+    ranked_rows: Vec<TxRow>,
 }
 
 impl Snapshot {
@@ -437,14 +524,15 @@ impl Snapshot {
         let mut expected_txs = 0usize;
         let mut min_tip = 0u128;
         let mut gas_used = 0u64;
-        let mut top_rows = Vec::new();
+        let mut ranked_rows = Vec::new();
 
-        for (fee, addr, nonce) in pq.iter().rev() {
+        for (fee, addr, nonce) in &pq {
             if let Some(tx) = handle.find_tx_by_addr_and_nonce(*addr, *nonce) {
-                if top_rows.len() < 8 {
+                if ranked_rows.len() < 256 {
                     let eta_blocks = handle.estimated_blocks_to_confirm(&tx.id).unwrap_or(0);
-                    top_rows.push(TxRow {
+                    ranked_rows.push(TxRow {
                         nonce: tx.nonce,
+                        effective_priority_fee: *fee,
                         priority_fee: tx.max_priority_fee_per_gas,
                         max_fee: tx.max_fee_per_gas,
                         gas_limit: tx.gas_limit,
@@ -487,7 +575,7 @@ impl Snapshot {
             pending_seen: telemetry.pending_seen,
             last_block_txs: telemetry.last_block_txs,
             last_block_gas_used: telemetry.last_block_gas_used,
-            top_rows,
+            ranked_rows,
         }
     }
 }
@@ -495,6 +583,7 @@ impl Snapshot {
 #[derive(Clone)]
 struct TxRow {
     nonce: u64,
+    effective_priority_fee: u128,
     priority_fee: u128,
     max_fee: u128,
     gas_limit: u64,
