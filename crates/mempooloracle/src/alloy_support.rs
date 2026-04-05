@@ -75,12 +75,7 @@ async fn connect_erased_provider(
     provider: DynProvider,
     config: TrackerConfig,
 ) -> Result<AlloyTrackerRuntime, AlloyTrackerError> {
-    let initial_txs = backfill_mempool(&provider).await?;
-
     let (event_tx, event_rx) = mpsc::channel();
-    let (handle, tracker) = MempoolTracker::from_channel(event_rx, &initial_txs, config);
-    thread::spawn(move || tracker.run());
-
     let block_sub = provider.subscribe_blocks().await?;
     let pending_sub = provider.subscribe_full_pending_transactions().await?;
 
@@ -92,6 +87,11 @@ async fn connect_erased_provider(
         block_sub,
     ));
     let pending_task = tokio::spawn(run_pending_subscription(event_tx, shutdown_rx, pending_sub));
+
+    let initial_txs = backfill_mempool(&provider).await?;
+
+    let (handle, tracker) = MempoolTracker::from_channel(event_rx, &initial_txs, config);
+    thread::spawn(move || tracker.run());
 
     Ok(AlloyTrackerRuntime {
         handle,
