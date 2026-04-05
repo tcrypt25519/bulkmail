@@ -26,6 +26,7 @@ mempooloracle = { path = "crates/mempooloracle", version = "0.1.0" }
 parking_lot = "0.12.1"
 rand = "0.10.0"
 secp256k1 = "0.31.1"
+serde = { version = "1.0.228", features = ["derive"] }
 simple_logger = "5.2.0"
 solana-client = { version = "2.2", default-features = false }
 solana-sdk = { version = "2.2", default-features = false, features = ["full"] }

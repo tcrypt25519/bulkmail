@@ -1,7 +1,12 @@
 //! A tracker for EIP-1559 mempool state and transaction confirmation latency.
+mod alloy_support;
+
+use alloy::providers::fillers::TxFiller;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock, mpsc::Receiver};
+
+pub use alloy_support::{AlloyTrackerError, AlloyTrackerRuntime};
 
 /// A unique identifier for a transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -80,8 +85,8 @@ pub struct MempoolTracker {
 }
 
 impl MempoolTracker {
-    /// Creates a new mempool tracker and its handle.
-    pub fn new(
+    /// Creates a new event-driven mempool tracker and its handle from a channel.
+    pub fn from_channel(
         rx: Receiver<MempoolEvent>,
         initial_txs: &[PendingTx],
         config: TrackerConfig,
@@ -112,6 +117,44 @@ impl MempoolTracker {
         };
 
         (handle, tracker)
+    }
+
+    /// Creates a new mempool tracker and its handle.
+    pub fn new(
+        rx: Receiver<MempoolEvent>,
+        initial_txs: &[PendingTx],
+        config: TrackerConfig,
+    ) -> (MempoolHandle, MempoolTracker) {
+        Self::from_channel(rx, initial_txs, config)
+    }
+
+    /// Creates a tracker runtime from an authenticated Alloy provider builder and websocket connector.
+    pub async fn connect_with_builder<L, F>(
+        builder: alloy::providers::ProviderBuilder<L, F>,
+        ws: alloy::providers::WsConnect,
+        config: TrackerConfig,
+    ) -> Result<AlloyTrackerRuntime, AlloyTrackerError>
+    where
+        L: alloy::providers::ProviderLayer<
+                alloy::providers::RootProvider,
+                alloy::network::Ethereum,
+            >,
+        F: TxFiller<alloy::network::Ethereum>
+            + alloy::providers::ProviderLayer<L::Provider, alloy::network::Ethereum>,
+        F::Provider: 'static,
+    {
+        alloy_support::connect_with_builder(builder, ws, config).await
+    }
+
+    /// Creates a tracker runtime from an existing Alloy pubsub-capable provider.
+    pub async fn connect_with_provider<P>(
+        provider: P,
+        config: TrackerConfig,
+    ) -> Result<AlloyTrackerRuntime, AlloyTrackerError>
+    where
+        P: alloy::providers::Provider<alloy::network::Ethereum> + 'static,
+    {
+        alloy_support::connect_with_provider(provider, config).await
     }
 
     /// Runs the tracker's event loop.

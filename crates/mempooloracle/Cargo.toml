@@ -6,7 +6,13 @@ authors.workspace = true
 license.workspace = true
 description = "Mempool tracking and confirmation-latency oracle for EIP-1559"
 
+[dependencies]
+alloy.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
 [lib]
 name = "mempooloracle"
 path = "src/lib.rs"
-
