@@ -26,6 +26,7 @@ use std::{
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = parse_args();
     let stop = Arc::new(AtomicBool::new(false));
     let telemetry = Arc::new(Mutex::new(Telemetry::default()));

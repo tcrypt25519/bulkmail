@@ -18,12 +18,18 @@ use futures::StreamExt;
 use serde::Deserialize;
 use std::{collections::HashMap, sync::mpsc, thread};
 use thiserror::Error;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle, time::{Duration, timeout}};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum AlloyTrackerError {
     #[error("alloy transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("timed out during {stage}")]
+    Timeout { stage: &'static str },
 }
 
 pub struct AlloyTrackerRuntime {
@@ -57,8 +63,12 @@ where
     F: TxFiller<Ethereum> + ProviderLayer<L::Provider, Ethereum>,
     F::Provider: 'static,
 {
-    install_rustls_provider();
-    let provider = builder.connect_ws(ws).await?.erased();
+    let provider = timeout(CONNECT_TIMEOUT, builder.connect_ws(ws))
+        .await
+        .map_err(|_| AlloyTrackerError::Timeout {
+            stage: "websocket connect",
+        })??
+        .erased();
     connect_erased_provider(provider, config).await
 }
 
@@ -69,6 +79,7 @@ pub async fn connect_with_provider<P>(
 where
     P: Provider<Ethereum> + 'static,
 {
+    install_rustls_provider();
     connect_erased_provider(provider.erased(), config).await
 }
 
@@ -80,9 +91,21 @@ async fn connect_erased_provider(
     provider: DynProvider,
     config: TrackerConfig,
 ) -> Result<AlloyTrackerRuntime, AlloyTrackerError> {
+    install_rustls_provider();
     let (event_tx, event_rx) = mpsc::channel();
-    let block_sub = provider.subscribe_blocks().await?;
-    let pending_sub = provider.subscribe_full_pending_transactions().await?;
+    let block_sub = timeout(SUBSCRIPTION_TIMEOUT, provider.subscribe_blocks())
+        .await
+        .map_err(|_| AlloyTrackerError::Timeout {
+            stage: "block subscription setup",
+        })??;
+    let pending_sub = timeout(
+        SUBSCRIPTION_TIMEOUT,
+        provider.subscribe_full_pending_transactions(),
+    )
+    .await
+    .map_err(|_| AlloyTrackerError::Timeout {
+        stage: "pending transaction subscription setup",
+    })??;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let block_task = tokio::spawn(run_block_subscription(
@@ -93,7 +116,11 @@ async fn connect_erased_provider(
     ));
     let pending_task = tokio::spawn(run_pending_subscription(event_tx, shutdown_rx, pending_sub));
 
-    let initial_txs = backfill_mempool(&provider).await?;
+    let initial_txs = timeout(BACKFILL_TIMEOUT, backfill_mempool(&provider))
+        .await
+        .map_err(|_| AlloyTrackerError::Timeout {
+            stage: "txpool backfill",
+        })??;
 
     let (handle, tracker) = MempoolTracker::from_channel(event_rx, &initial_txs, config);
     thread::spawn(move || tracker.run());
