@@ -2,8 +2,8 @@ use alloy::providers::{WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
-    BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, P2pTransportConfig, PendingTx,
-    TrackerConfig, TrackerTransport, TxId,
+    BlockUpdate, MempoolEvent, MempoolHandle, MempoolTracker, P2pBlockTransport,
+    P2pTransportConfig, PendingTx, TrackerConfig, TrackerTransport, TxId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -65,6 +65,7 @@ async fn main() -> io::Result<()> {
                 bootnodes,
                 discovery_v4,
                 listen_addr: None,
+                block_transport: P2pBlockTransport::Disabled,
             });
             let runtime = MempoolTracker::connect(transport, config.clone())
                 .await

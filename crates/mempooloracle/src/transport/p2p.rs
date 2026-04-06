@@ -1,8 +1,9 @@
 #[cfg(feature = "reth-p2p")]
 mod enabled {
     use crate::{
-        Address, BlockUpdate, MempoolEvent, MempoolTracker, P2pTransportConfig, PendingTx,
-        TrackerConfig, TrackerError, TrackerRuntime, TxId,
+        Address, BlockUpdate, ConsensusTransportImplementation, MempoolEvent, MempoolTracker,
+        P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig, TrackerError,
+        TrackerRuntime, TxId,
         runtime::{DEFAULT_SHUTDOWN_VALUE, RuntimeTelemetry, TransportKind},
     };
     use alloy::{
@@ -65,6 +66,23 @@ mod enabled {
             return Err(TrackerError::UnsupportedTransport(
                 "embedded reth p2p currently supports mainnet only",
             ));
+        }
+
+        match &config.block_transport {
+            P2pBlockTransport::Disabled => {}
+            P2pBlockTransport::ExecutionPolling => {
+                return Err(TrackerError::UnsupportedTransport(
+                    "execution p2p block polling does not cover mainnet PoS head blocks; use a consensus block transport instead",
+                ));
+            }
+            P2pBlockTransport::Consensus(consensus) => {
+                let _implementation = match consensus.implementation {
+                    ConsensusTransportImplementation::Eth2Libp2p => "eth2_libp2p",
+                };
+                return Err(TrackerError::UnsupportedTransport(
+                    "consensus p2p block transport is not implemented yet",
+                ));
+            }
         }
 
         let client = NoopProvider::default();
@@ -130,25 +148,22 @@ mod enabled {
             telemetry.clone(),
             shutdown_rx.clone(),
         ));
-        let block_task = tokio::spawn(run_block_poller(
-            sessions,
-            event_tx,
-            telemetry.clone(),
-            shutdown_rx,
-        ));
+        let mut tasks = vec![network_task, txpool_task, pending_task, backfill_task, peer_events_task];
+
+        if matches!(config.block_transport, P2pBlockTransport::ExecutionPolling) {
+            tasks.push(tokio::spawn(run_block_poller(
+                sessions,
+                event_tx,
+                telemetry.clone(),
+                shutdown_rx,
+            )));
+        }
 
         Ok(TrackerRuntime::new(
             handle,
             telemetry,
             shutdown_tx,
-            vec![
-                network_task,
-                txpool_task,
-                pending_task,
-                backfill_task,
-                peer_events_task,
-                block_task,
-            ],
+            tasks,
         ))
     }
 

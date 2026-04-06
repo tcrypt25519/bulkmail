@@ -30,6 +30,7 @@ mod tests {
                 bootnodes: vec![],
                 discovery_v4: true,
                 listen_addr: None,
+                block_transport: P2pBlockTransport::Disabled,
             }),
             default_config(),
         )

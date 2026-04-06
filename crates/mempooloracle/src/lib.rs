@@ -31,6 +31,24 @@ pub struct P2pTransportConfig {
     pub bootnodes: Vec<String>,
     pub discovery_v4: bool,
     pub listen_addr: Option<std::net::SocketAddr>,
+    pub block_transport: P2pBlockTransport,
+}
+
+#[derive(Clone, Debug)]
+pub enum P2pBlockTransport {
+    Disabled,
+    ExecutionPolling,
+    Consensus(ConsensusTransportConfig),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConsensusTransportConfig {
+    pub implementation: ConsensusTransportImplementation,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConsensusTransportImplementation {
+    Eth2Libp2p,
 }
 
 #[derive(Debug, thiserror::Error)]
