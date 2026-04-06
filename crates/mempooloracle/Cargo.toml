@@ -8,13 +8,15 @@ description = "Mempool tracking and confirmation-latency oracle for EIP-1559"
 
 [features]
 default = []
-reth-p2p = []
+reth-p2p = ["dep:reth-ethereum", "dep:reth-network-peers"]
 
 [dependencies]
 alloy.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 ratatui.workspace = true
+reth-ethereum = { workspace = true, optional = true, features = ["network", "pool", "provider", "test-utils"] }
+reth-network-peers = { workspace = true, optional = true }
 rustls.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -27,6 +27,8 @@ mempooloracle = { path = "crates/mempooloracle", version = "0.1.0" }
 parking_lot = "0.12.1"
 rand = "0.10.0"
 ratatui = "0.29.0"
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.3", default-features = false }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.3", default-features = false }
 rustls = { version = "0.23.36", default-features = false, features = ["std", "ring"] }
 secp256k1 = "0.31.1"
 serde = { version = "1.0.228", features = ["derive"] }

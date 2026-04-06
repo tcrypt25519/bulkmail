@@ -39,6 +39,8 @@ pub enum TrackerError {
     Transport(#[from] alloy::transports::TransportError),
     #[error("timed out during {stage}")]
     Timeout { stage: &'static str },
+    #[error("transport setup failed: {0}")]
+    Setup(String),
     #[error("feature `{0}` is not enabled")]
     FeatureDisabled(&'static str),
     #[error("transport unsupported: {0}")]
