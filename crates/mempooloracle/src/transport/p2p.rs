@@ -69,7 +69,6 @@ mod enabled {
         }
 
         match &config.block_transport {
-            P2pBlockTransport::Disabled => {}
             P2pBlockTransport::ExecutionPolling => {
                 return Err(TrackerError::UnsupportedTransport(
                     "execution p2p block polling does not cover mainnet PoS head blocks; use a consensus block transport instead",

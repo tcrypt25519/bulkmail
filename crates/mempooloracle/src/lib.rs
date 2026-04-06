@@ -36,7 +36,6 @@ pub struct P2pTransportConfig {
 
 #[derive(Clone, Debug)]
 pub enum P2pBlockTransport {
-    Disabled,
     ExecutionPolling,
     Consensus(ConsensusTransportConfig),
 }
