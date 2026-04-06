@@ -1,5 +1,9 @@
 #[cfg(feature = "reth-p2p")]
 mod enabled {
+    #[cfg(feature = "consensus-p2p")]
+    type ConsensusNetworkEvent =
+        eth2_libp2p::NetworkEvent<grandine_types::preset::Mainnet>;
+
     use crate::{
         Address, BlockUpdate, ConsensusTransportImplementation, MempoolEvent, MempoolTracker,
         P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig, TrackerError,
@@ -75,9 +79,13 @@ mod enabled {
                 ));
             }
             P2pBlockTransport::Consensus(consensus) => {
+                #[cfg(feature = "consensus-p2p")]
+                let _event_type_check: Option<ConsensusNetworkEvent> = None;
                 let _implementation = match consensus.implementation {
                     ConsensusTransportImplementation::Eth2Libp2p => "eth2_libp2p",
                 };
+                #[cfg(not(feature = "consensus-p2p"))]
+                return Err(TrackerError::FeatureDisabled("consensus-p2p"));
                 return Err(TrackerError::UnsupportedTransport(
                     "consensus p2p block transport is not implemented yet",
                 ));

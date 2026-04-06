@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/bulkmail", "crates/mempooloracle"]
+exclude = ["third_party/grandine"]
 resolver = "3"
 
 [workspace.package]

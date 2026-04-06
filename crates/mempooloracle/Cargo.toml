@@ -9,12 +9,17 @@ description = "Mempool tracking and confirmation-latency oracle for EIP-1559"
 [features]
 default = []
 reth-p2p = ["dep:reth-ethereum", "dep:reth-network-peers"]
+consensus-p2p = ["dep:eth2_libp2p", "dep:grandine_bls", "dep:grandine_kzg_utils", "dep:grandine_types"]
 
 [dependencies]
 alloy.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 ratatui.workspace = true
+eth2_libp2p = { path = "../../third_party/grandine/eth2_libp2p", optional = true }
+grandine_bls = { package = "bls", path = "../../third_party/grandine/bls", optional = true, features = ["zkcrypto"] }
+grandine_kzg_utils = { package = "kzg_utils", path = "../../third_party/grandine/kzg_utils", optional = true, features = ["zkcrypto"] }
+grandine_types = { package = "types", path = "../../third_party/grandine/types", optional = true }
 reth-ethereum = { workspace = true, optional = true, features = ["network", "pool", "provider", "test-utils"] }
 reth-network-peers = { workspace = true, optional = true }
 rustls.workspace = true
