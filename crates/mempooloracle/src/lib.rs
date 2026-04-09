@@ -79,8 +79,19 @@ pub struct Address(pub [u8; 20]);
 pub enum MempoolEvent {
     /// A new transaction has entered the mempool.
     PendingTransaction(PendingTx),
+    /// The tracker must discard all state and restart from a fresh anchor.
+    Reset(TrackerReset),
     /// A new block has been mined.
     NewBlock(BlockUpdate),
+}
+
+/// A reset instruction for the tracker after block continuity was lost.
+#[derive(Debug, Clone)]
+pub struct TrackerReset {
+    /// The base fee to use for the new anchor point.
+    pub base_fee: u128,
+    /// The latest observed block gas limit to use after re-anchoring.
+    pub gas_limit: u64,
 }
 
 /// A pending transaction in the mempool.
@@ -234,6 +245,10 @@ impl MempoolTracker {
                     let mut inner = self.inner.write().unwrap();
                     inner.insert(tx);
                 }
+                Ok(MempoolEvent::Reset(reset)) => {
+                    let mut inner = self.inner.write().unwrap();
+                    inner.reset(reset);
+                }
                 Ok(MempoolEvent::NewBlock(block)) => {
                     let mut inner = self.inner.write().unwrap();
                     inner.apply_block(block);
@@ -245,6 +260,15 @@ impl MempoolTracker {
 }
 
 impl MempoolInner {
+    fn reset(&mut self, reset: TrackerReset) {
+        self.account_queues.clear();
+        self.base_fee_eligibility.clear();
+        self.priority_queue.clear();
+        self.current_base_fee = reset.base_fee;
+        self.private_flow_ratio = self.config.private_flow_prior;
+        self.last_block_gas_limit = reset.gas_limit;
+    }
+
     fn effective_priority_fee(&self, tx: &PendingTx) -> u128 {
         tx.max_priority_fee_per_gas
             .min(tx.max_fee_per_gas.saturating_sub(self.current_base_fee))

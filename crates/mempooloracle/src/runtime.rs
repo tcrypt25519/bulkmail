@@ -64,8 +64,26 @@ impl TrackerTelemetry {
             last_block_gas_used: self.inner.last_block_gas_used.load(Ordering::Relaxed),
             initial_backfill_txs: self.inner.initial_backfill_txs.load(Ordering::Relaxed),
             p2p_peer_count: self.inner.p2p_peer_count.load(Ordering::Relaxed),
+            consensus_peer_count: self.inner.consensus_peer_count.load(Ordering::Relaxed),
             p2p_announced_txs: self.inner.p2p_announced_txs.load(Ordering::Relaxed),
             p2p_imported_txs: self.inner.p2p_imported_txs.load(Ordering::Relaxed),
+            consensus_anchor_block_number: self
+                .inner
+                .consensus_anchor_block_number
+                .load(Ordering::Relaxed),
+            consensus_next_expected_block_number: self
+                .inner
+                .consensus_next_expected_block_number
+                .load(Ordering::Relaxed),
+            consensus_last_block_number: self
+                .inner
+                .consensus_last_block_number
+                .load(Ordering::Relaxed),
+            consensus_gap_resets: self.inner.consensus_gap_resets.load(Ordering::Relaxed),
+            consensus_recovered_blocks: self
+                .inner
+                .consensus_recovered_blocks
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -86,8 +104,14 @@ pub struct TrackerTelemetrySnapshot {
     pub last_block_gas_used: u64,
     pub initial_backfill_txs: usize,
     pub p2p_peer_count: usize,
+    pub consensus_peer_count: usize,
     pub p2p_announced_txs: u64,
     pub p2p_imported_txs: u64,
+    pub consensus_anchor_block_number: u64,
+    pub consensus_next_expected_block_number: u64,
+    pub consensus_last_block_number: u64,
+    pub consensus_gap_resets: u64,
+    pub consensus_recovered_blocks: u64,
 }
 
 pub(crate) struct RuntimeTelemetry {
@@ -98,8 +122,14 @@ pub(crate) struct RuntimeTelemetry {
     last_block_gas_used: AtomicU64,
     initial_backfill_txs: AtomicUsize,
     p2p_peer_count: AtomicUsize,
+    consensus_peer_count: AtomicUsize,
     p2p_announced_txs: AtomicU64,
     p2p_imported_txs: AtomicU64,
+    consensus_anchor_block_number: AtomicU64,
+    consensus_next_expected_block_number: AtomicU64,
+    consensus_last_block_number: AtomicU64,
+    consensus_gap_resets: AtomicU64,
+    consensus_recovered_blocks: AtomicU64,
 }
 
 impl RuntimeTelemetry {
@@ -112,8 +142,14 @@ impl RuntimeTelemetry {
             last_block_gas_used: AtomicU64::default(),
             initial_backfill_txs: AtomicUsize::default(),
             p2p_peer_count: AtomicUsize::default(),
+            consensus_peer_count: AtomicUsize::default(),
             p2p_announced_txs: AtomicU64::default(),
             p2p_imported_txs: AtomicU64::default(),
+            consensus_anchor_block_number: AtomicU64::default(),
+            consensus_next_expected_block_number: AtomicU64::default(),
+            consensus_last_block_number: AtomicU64::default(),
+            consensus_gap_resets: AtomicU64::default(),
+            consensus_recovered_blocks: AtomicU64::default(),
         }
     }
 
@@ -137,6 +173,11 @@ impl RuntimeTelemetry {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn record_consensus_peer_count(&self, peers: usize) {
+        self.consensus_peer_count.store(peers, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn record_p2p_announcement(&self) {
         self.p2p_announced_txs.fetch_add(1, Ordering::Relaxed);
     }
@@ -144,5 +185,34 @@ impl RuntimeTelemetry {
     #[allow(dead_code)]
     pub(crate) fn record_p2p_import(&self) {
         self.p2p_imported_txs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_consensus_anchor(&self, block_number: u64) {
+        self.consensus_anchor_block_number
+            .store(block_number, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_consensus_next_expected(&self, block_number: u64) {
+        self.consensus_next_expected_block_number
+            .store(block_number, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_consensus_last_block(&self, block_number: u64) {
+        self.consensus_last_block_number
+            .store(block_number, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_consensus_gap_reset(&self) {
+        self.consensus_gap_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_consensus_recovered_blocks(&self, recovered: u64) {
+        self.consensus_recovered_blocks
+            .fetch_add(recovered, Ordering::Relaxed);
     }
 }
