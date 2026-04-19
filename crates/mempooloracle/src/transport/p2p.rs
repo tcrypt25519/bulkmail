@@ -1,10 +1,11 @@
+//! P2P network transport for mempool tracking.
 #[cfg(feature = "reth-p2p")]
 mod enabled {
     use alloy::consensus::Transaction as _;
     use crate::{
         Address, BlockUpdate, ConsensusTransportImplementation, MempoolEvent, MempoolTracker,
         P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig, TrackerError,
-        TrackerReset, TrackerRuntime, TxId,
+        TrackerPrune, TrackerRuntime, TxId, ExecutionHash, Slot, BlockNumber,
         runtime::{DEFAULT_SHUTDOWN_VALUE, RuntimeTelemetry, TransportKind},
     };
     use futures::{StreamExt, channel::mpsc as futures_mpsc};
@@ -17,10 +18,12 @@ mod enabled {
         },
         provider::test_utils::NoopProvider,
         primitives::SignerRecoverable as _,
+        chainspec::{Head, MAINNET as chainspecs},
     };
     use reth_network_peers::TrustedPeer;
+    use alloy::primitives::{B256, U256};
     use std::{
-        collections::{BTreeMap, HashSet},
+        collections::{HashMap, HashSet, BTreeMap},
         path::PathBuf,
         str::FromStr,
         sync::{Arc, mpsc},
@@ -31,6 +34,39 @@ mod enabled {
         sync::watch,
         task::JoinHandle,
     };
+
+    struct P2pAuditLogger {
+        file: Option<std::io::BufWriter<std::fs::File>>,
+    }
+
+    impl P2pAuditLogger {
+        fn new(path: Option<std::path::PathBuf>) -> Self {
+            let file = path.and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+                    .map(std::io::BufWriter::new)
+            });
+            Self { file }
+        }
+
+        fn log(&mut self, layer: &str, direction: &str, peer_id: &str, event: &str) {
+            if let Some(ref mut writer) = self.file {
+                use std::io::Write;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let _ = writeln!(
+                    writer,
+                    "[{now}] {layer:4} {direction:3} {peer_id} {event}"
+                );
+                let _ = writer.flush();
+            }
+        }
+    }
 
     type EmbeddedPool = Pool<
         OkValidator<EthPooledTransaction>,
@@ -65,94 +101,108 @@ mod enabled {
 
         #[cfg(feature = "consensus-p2p")]
         {
-            if !matches!(
-                consensus_config.implementation,
-                ConsensusTransportImplementation::Eth2Libp2p
-            ) {
-                return Err(TrackerError::UnsupportedTransport(
-                    "unsupported consensus p2p implementation",
-                ));
+            let client = NoopProvider::default();
+            let pool: EmbeddedPool = Pool::new(
+                OkValidator::default(),
+                CoinbaseTipOrdering::default(),
+                InMemoryBlobStore::default(),
+                Default::default(),
+            );
+
+            let local_key = reth_ethereum::network::config::rng_secret_key();
+            let mut builder = NetworkConfig::builder(local_key);
+
+            if let Some(addr) = config.listen_addr {
+                builder = builder.set_addrs(addr);
+            } else if let Some(port) = config.execution_port {
+                builder = builder.set_addrs(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
             }
+
+            if config.bootnodes.is_empty() {
+                builder = builder.mainnet_boot_nodes();
+            } else {
+                let boot_nodes = parse_execution_bootnodes(&config.bootnodes)?;
+                builder = builder.boot_nodes(boot_nodes);
+            }
+
+            if !config.discovery_v4 {
+                builder = builder.disable_discv4_discovery();
+            }
+
+            let mut network_config = builder.build(client);
+            network_config.chain_id = chainspecs.chain().id();
+            
+            let transactions_manager_config = network_config.transactions_manager_config.clone();
+
+            let (network_handle, network, txpool, _eth) = NetworkManager::builder(network_config)
+                .await
+                .map_err(|err| TrackerError::Setup(err.to_string()))?
+                .transactions(pool.clone(), transactions_manager_config)
+                .split_with_handle();
+
+            // Initial status update
+            let head_hash = B256::from_str("0x41110c60043ad922dc366d7a54a31e8b802233d095e59e139621200b1aea67f8").unwrap();
+            network_handle.update_status(Head {
+                number: 24898298,
+                hash: head_hash,
+                difficulty: U256::ZERO,
+                total_difficulty: U256::ZERO,
+                timestamp: 1776414463,
+            });
+
+            let (event_tx, event_rx) = mpsc::channel();
+            let telemetry = Arc::new(RuntimeTelemetry::new(TransportKind::P2p));
+            let (shutdown_tx, shutdown_rx) = watch::channel(DEFAULT_SHUTDOWN_VALUE);
+
+            let (handle, tracker) = MempoolTracker::from_channel(event_rx, &[], tracker_config);
+            let _tracker_task = thread::spawn(move || tracker.run());
+
+            let network_task = tokio::spawn(network);
+            let txpool_task = tokio::spawn(txpool);
+            let pending_task = tokio::spawn(run_pending_listener(
+                pool.clone(),
+                event_tx.clone(),
+                telemetry.clone(),
+                config.log_path.clone(),
+                shutdown_rx.clone(),
+            ));
+            let backfill_task = tokio::spawn(run_backfill(
+                pool.clone(),
+                event_tx.clone(),
+                telemetry.clone(),
+                config.log_path.clone(),
+                shutdown_rx.clone(),
+            ));
+            let peer_events_task = tokio::spawn(run_execution_peer_event_listener(
+                network_handle.clone(),
+                telemetry.clone(),
+                config.log_path.clone(),
+                shutdown_rx.clone(),
+            ));
+
+            #[cfg(feature = "consensus-p2p")]
+            let consensus_task = tokio::spawn(consensus::run_consensus_block_listener(
+                config,
+                pool,
+                event_tx,
+                telemetry.clone(),
+                network_handle,
+                shutdown_rx,
+            ));
+
+            let mut tasks: Vec<JoinHandle<()>> =
+                vec![network_task, txpool_task, pending_task, backfill_task, peer_events_task];
+
+            #[cfg(feature = "consensus-p2p")]
+            tasks.push(consensus_task);
+
+            Ok(TrackerRuntime::new(
+                handle,
+                telemetry,
+                shutdown_tx,
+                tasks,
+            ))
         }
-
-        let client = NoopProvider::default();
-        let pool: EmbeddedPool = Pool::new(
-            OkValidator::default(),
-            CoinbaseTipOrdering::default(),
-            InMemoryBlobStore::default(),
-            Default::default(),
-        );
-
-        let local_key = reth_ethereum::network::config::rng_secret_key();
-        let mut builder = NetworkConfig::builder(local_key);
-
-        if let Some(addr) = config.listen_addr {
-            builder = builder.set_addrs(addr);
-        }
-
-        if config.bootnodes.is_empty() {
-            builder = builder.mainnet_boot_nodes();
-        } else {
-            let boot_nodes = parse_execution_bootnodes(&config.bootnodes)?;
-            builder = builder.boot_nodes(boot_nodes);
-        }
-
-        if !config.discovery_v4 {
-            builder = builder.disable_discv4_discovery();
-        }
-
-        let network_config = builder.build(client);
-        let transactions_manager_config = network_config.transactions_manager_config.clone();
-
-        let (network_handle, network, txpool, _eth) = NetworkManager::builder(network_config)
-            .await
-            .map_err(|err| TrackerError::Setup(err.to_string()))?
-            .transactions(pool.clone(), transactions_manager_config)
-            .split_with_handle();
-
-        let (event_tx, event_rx) = mpsc::channel();
-        let telemetry = Arc::new(RuntimeTelemetry::new(TransportKind::P2p));
-        let (shutdown_tx, shutdown_rx) = watch::channel(DEFAULT_SHUTDOWN_VALUE);
-
-        let (handle, tracker) = MempoolTracker::from_channel(event_rx, &[], tracker_config);
-        thread::spawn(move || tracker.run());
-
-        let network_task = tokio::spawn(network);
-        let txpool_task = tokio::spawn(txpool);
-        let pending_task = tokio::spawn(run_pending_listener(
-            pool.clone(),
-            event_tx.clone(),
-            telemetry.clone(),
-            shutdown_rx.clone(),
-        ));
-        let backfill_task = tokio::spawn(run_backfill(
-            pool.clone(),
-            event_tx.clone(),
-            telemetry.clone(),
-            shutdown_rx.clone(),
-        ));
-        let peer_events_task = tokio::spawn(run_execution_peer_event_listener(
-            network_handle,
-            telemetry.clone(),
-            shutdown_rx.clone(),
-        ));
-
-        #[cfg(feature = "consensus-p2p")]
-        let consensus_task = tokio::spawn(run_consensus_block_listener(
-            config,
-            pool,
-            event_tx,
-            telemetry.clone(),
-            shutdown_rx,
-        ));
-
-        let mut tasks: Vec<JoinHandle<()>> =
-            vec![network_task, txpool_task, pending_task, backfill_task, peer_events_task];
-
-        #[cfg(feature = "consensus-p2p")]
-        tasks.push(consensus_task);
-
-        Ok(TrackerRuntime::new(handle, telemetry, shutdown_tx, tasks))
     }
 
     fn parse_execution_bootnodes(bootnodes: &[String]) -> Result<Vec<TrustedPeer>, TrackerError> {
@@ -168,53 +218,89 @@ mod enabled {
             .collect()
     }
 
-    async fn run_backfill(
-        pool: EmbeddedPool,
-        event_tx: mpsc::Sender<MempoolEvent>,
+    async fn run_execution_peer_event_listener(
+        network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
         telemetry: Arc<RuntimeTelemetry>,
+        log_path: Option<PathBuf>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let existing = pool
-            .pooled_transactions()
-            .into_iter()
-            .map(|tx| pending_tx_from_reth(&tx))
-            .collect::<Vec<_>>();
+        let mut events = network_handle.event_listener();
+        let mut peers = HashSet::new();
+        let mut peer_directions = HashMap::new();
+        let mut audit_log = P2pAuditLogger::new(log_path);
 
-        telemetry.record_backfill_size(existing.len());
-
-        for tx in existing {
+        loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                else => {
-                    if event_tx.send(MempoolEvent::PendingTransaction(tx)).is_err() {
+                maybe_event = events.next() => {
+                    let Some(event) = maybe_event else {
                         break;
+                    };
+
+                    match event {
+                        NetworkEvent::ActivePeerSession { info, .. } => {
+                            tracing::debug!(peer_id = %info.peer_id, "Execution peer session active");
+                            // TODO: Correctly determine direction
+                            let is_ingress = true; 
+                            let dir_str = if is_ingress { "IN " } else { "OUT" };
+                            audit_log.log("EL", dir_str, &info.peer_id.to_string(), "SessionActive");
+                            
+                            if peers.insert(info.peer_id) {
+                                peer_directions.insert(info.peer_id, is_ingress);
+                                telemetry.record_el_connection(info.peer_id.to_string(), is_ingress);
+                            }
+                            telemetry.record_p2p_peer_count(peers.len());
+                        }
+                        NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
+                            tracing::debug!(peer_id = %info.peer_id, "Execution peer connected");
+                            // TODO: Correctly determine direction
+                            let is_ingress = true; 
+                            let dir_str = if is_ingress { "IN " } else { "OUT" };
+                            audit_log.log("EL", dir_str, &info.peer_id.to_string(), "Connected");
+                            
+                            if peers.insert(info.peer_id) {
+                                peer_directions.insert(info.peer_id, is_ingress);
+                                telemetry.record_el_connection(info.peer_id.to_string(), is_ingress);
+                            }
+                            telemetry.record_p2p_peer_count(peers.len());
+                        }
+                        NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) => {
+                            tracing::debug!(peer_id = %peer_id, "Execution peer session closed");
+                            audit_log.log("EL", "END", &peer_id.to_string(), "SessionClosed");
+                            peers.remove(&peer_id);
+                            if let Some(is_ingress) = peer_directions.remove(&peer_id) {
+                                telemetry.record_el_disconnection(is_ingress);
+                            }
+                            telemetry.record_p2p_peer_count(peers.len());
+                        }
+                        NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
+                            tracing::debug!(peer_id = %peer_id, "Execution peer removed");
+                            audit_log.log("EL", "END", &peer_id.to_string(), "PeerRemoved");
+                            peers.remove(&peer_id);
+                            if let Some(is_ingress) = peer_directions.remove(&peer_id) {
+                                telemetry.record_el_disconnection(is_ingress);
+                            }
+                            telemetry.record_p2p_peer_count(peers.len());
+                        }
+                        NetworkEvent::Peer(other) => {
+                            tracing::trace!(event = ?other, "Other execution peer event");
+                            audit_log.log("EL", "INF", "unknown", &format!("{other:?}"));
+                        }
                     }
                 }
             }
         }
     }
 
-    async fn replay_pool_snapshot(pool: &EmbeddedPool, event_tx: &mpsc::Sender<MempoolEvent>) -> bool {
-        for tx in pool
-            .pooled_transactions()
-            .into_iter()
-            .map(|tx| pending_tx_from_reth(&tx))
-        {
-            if event_tx.send(MempoolEvent::PendingTransaction(tx)).is_err() {
-                return false;
-            }
-        }
-
-        true
-    }
-
     async fn run_pending_listener(
         pool: EmbeddedPool,
         event_tx: mpsc::Sender<MempoolEvent>,
         telemetry: Arc<RuntimeTelemetry>,
+        log_path: Option<PathBuf>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let mut listener = pool.pending_transactions_listener_for(TransactionListenerKind::All);
+        let mut audit_log = P2pAuditLogger::new(log_path);
 
         loop {
             tokio::select! {
@@ -228,8 +314,10 @@ mod enabled {
                         continue;
                     };
 
+                    audit_log.log("EL", "IN ", "pool", &format!("NewPendingTx {hash:?}"));
                     telemetry.record_pending_seen();
                     telemetry.record_p2p_import();
+                    telemetry.record_el_txs_received();
 
                     if event_tx
                         .send(MempoolEvent::PendingTransaction(pending_tx_from_reth(&tx)))
@@ -242,33 +330,30 @@ mod enabled {
         }
     }
 
-    async fn run_execution_peer_event_listener(
-        network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
+    async fn run_backfill(
+        pool: EmbeddedPool,
+        event_tx: mpsc::Sender<MempoolEvent>,
         telemetry: Arc<RuntimeTelemetry>,
+        log_path: Option<PathBuf>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let mut events = network_handle.event_listener();
-        let mut peers = HashSet::new();
+        let mut audit_log = P2pAuditLogger::new(log_path);
+        let existing = pool
+            .pooled_transactions()
+            .into_iter()
+            .map(|tx| pending_tx_from_reth(&tx))
+            .collect::<Vec<_>>();
 
-        loop {
+        telemetry.record_backfill_size(existing.len());
+        audit_log.log("EL", "INF", "pool", &format!("BackfillStart count={}", existing.len()));
+
+        for tx in existing {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                maybe_event = events.next() => {
-                    let Some(event) = maybe_event else {
+                else => {
+                    audit_log.log("EL", "OUT", "tracker", &format!("BackfillTx {:?}", tx.id));
+                    if event_tx.send(MempoolEvent::PendingTransaction(tx)).is_err() {
                         break;
-                    };
-
-                    match event {
-                        NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
-                            peers.insert(info.peer_id);
-                            telemetry.record_p2p_peer_count(peers.len());
-                        }
-                        NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) |
-                        NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
-                            peers.remove(&peer_id);
-                            telemetry.record_p2p_peer_count(peers.len());
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -278,12 +363,13 @@ mod enabled {
     fn pending_tx_from_signed(tx: &TransactionSigned) -> Option<PendingTx> {
         let sender = tx.recover_signer().ok()?;
         Some(PendingTx {
-            id: TxId(tx.tx_hash().0),
+            id: ExecutionHash::from(tx.tx_hash().0),
             sender: Address(sender.0 .0),
             nonce: tx.nonce(),
             max_fee_per_gas: tx.max_fee_per_gas(),
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas().unwrap_or_default(),
             gas_limit: tx.gas_limit(),
+            seen_at: std::time::SystemTime::now(),
         })
     }
 
@@ -291,7 +377,7 @@ mod enabled {
         tx: &reth_ethereum::pool::ValidPoolTransaction<EthPooledTransaction>,
     ) -> PendingTx {
         PendingTx {
-            id: TxId(tx.hash().0),
+            id: ExecutionHash::from(tx.hash().0),
             sender: Address(tx.sender().0.0),
             nonce: tx.nonce(),
             max_fee_per_gas: tx.max_fee_per_gas(),
@@ -300,13 +386,14 @@ mod enabled {
                 .max_priority_fee_per_gas()
                 .unwrap_or_else(|| tx.priority_fee_or_price()),
             gas_limit: tx.gas_limit(),
+            seen_at: std::time::SystemTime::now(),
         }
     }
 
     #[cfg(feature = "consensus-p2p")]
     mod consensus {
         use super::*;
-        use alloy::eips::Decodable2718;
+        use alloy::eips::eip2718::Decodable2718;
         use eth2_libp2p::{
             Context, Enr, MessageAcceptance, NetworkConfig as ConsensusNetworkConfig, NetworkEvent,
             PeerId, PubsubMessage, Response,
@@ -314,54 +401,87 @@ mod enabled {
             rpc::{RequestType, StatusMessage, StatusMessageV2},
             rpc::methods::OldBlocksByRangeRequest,
             service::Network as ConsensusNetwork,
-            service::api_types::AppRequestId,
+            service::api_types::{self, AppRequestId},
             types::{EnrForkId, ForkContext, GossipKind},
         };
         use grandine_types::{
             combined::{ExecutionPayload as CombinedExecutionPayload, SignedBeaconBlock as CombinedSignedBeaconBlock},
             config::Config as ChainConfig,
             nonstandard::Phase,
+            phase0::{primitives::H256, consts::FAR_FUTURE_EPOCH},
             preset::Mainnet,
             traits::SignedBeaconBlock as _,
         };
-        use std::{collections::HashMap, fs, net::Ipv4Addr, sync::Arc};
+        use std::{collections::{HashMap, BTreeMap, HashSet}, fs, net::Ipv4Addr, sync::Arc};
 
-        const MAX_RECOVERY_RANGE: u64 = 128;
+        const MAINNET_GENESIS_VALIDATORS_ROOT: H256 = H256([
+            0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f, 0xdd, 0x4e,
+            0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f, 0x51, 0x1b, 0xfe, 0x95
+        ]);
 
-        #[derive(Clone)]
+        const MAINNET_CONSENSUS_BOOTNODES: &[&str] = &[
+            "enr:-KG4QNTx85fjxABbSq_Rta9wy56nQ1fHK0PewJbGjLm1M4bMGx5-3Qq4ZX2-iFJ0pys_O90sVXNNOxp2E7afBsGsBrgDhGV0aDKQu6TalgMAAAD__________4JpZIJ2NIJpcIQEnfA2iXNlY3AyNTZrMaECGXWQ-rQ2KZKRH1aOW4IlPDBkY4XDphxg9pxKytFCkayDdGNwgiMog3VkcIIjKA",
+            "enr:-KG4QF4B5WrlFcRhUU6dZETwY5ZzAXnA0vGC__L1Kdw602nDZwXSTs5RFXFIFUnbQJmhNGVU6OIX7KVrCSTODsz1tK4DhGV0aDKQu6TalgMAAAD__________4JpZIJ2NIJpcIQExNYEiXNlY3AyNTZrMaECQmM9vp7KhaXhI-nqL_R0ovULLCFSFTa9CPPSdb1zPX6DdGNwgiMog3VkcIIjKA",
+            "enr:-Iu4QCV0e-_1Uw7p5mwRgx02z2zxnCGXCrWaBZspT0bZT6kcdA9nkWTHRsz2zt09SB2QJ46qhNjOKzQPMcz6MH1pq3MLY26CaWSCdjSCaXCEwiErIHDDAgIBiXNlY3AyNTZrMaEDF0wfAJ-f1UZtpG7RdNSiVhjDl_ktP1dsDioUcGO2f1ODdWRwgiOM",
+            "enr:-Iu4QHs9DjoZ6gJHeOba6GbjXVl212tQsfX0TWrNeIXDLt42HHh8shfpUIzEZLSdnH9PIMox24uAYgmh4BAkhbb1_34LY26CaWSCdjSCaXCEwiErIXDDAgIBiXNlY3AyNTZrMaEDjj_JhExvBxl-vod_kHHqwBTJImdUAaxxOs1Sq6tE_4WDdWRwgiOM",
+            "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg",
+        ];
+
+        #[derive(Clone, Debug)]
         struct ObservedBlock {
             number: u64,
+            hash: B256,
             slot: u64,
             update: BlockUpdate,
             source: PeerId,
         }
 
-        struct RecoveryRequest {
-            request_id: usize,
-            target_number: u64,
-            target_block: ObservedBlock,
+        struct RecoveryChunk {
+            request_id: api_types::Id,
+            start_slot: u64,
+            count: u64,
+            peer_id: PeerId,
+            sent_at: std::time::Instant,
+            retries: usize,
         }
 
         struct ConsensusState {
+            connected_peers: HashSet<PeerId>,
+            peer_statuses: HashMap<PeerId, StatusMessage>,
+            peer_directions: HashMap<PeerId, bool>,
+            pending_status_requests: HashMap<PeerId, std::time::Instant>,
+            pending_recovery_chunks: HashMap<api_types::Id, RecoveryChunk>,
+            slot_to_number: HashMap<u64, u64>,
+            recovery_target_number: Option<u64>,
+            recovery_target_block: Option<ObservedBlock>,
             last_emitted_number: Option<u64>,
             last_emitted_slot: Option<u64>,
             buffered: BTreeMap<u64, ObservedBlock>,
-            connected_peers: HashSet<PeerId>,
-            peer_statuses: HashMap<PeerId, StatusMessage>,
-            recovery: Option<RecoveryRequest>,
-            next_request_id: usize,
+            next_request_id: api_types::Id,
+            network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
+            audit_log: P2pAuditLogger,
         }
 
         impl ConsensusState {
-            fn new() -> Self {
+            fn new(
+                network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
+                log_path: Option<std::path::PathBuf>,
+            ) -> Self {
                 Self {
+                    connected_peers: HashSet::new(),
+                    peer_statuses: HashMap::new(),
+                    peer_directions: HashMap::new(),
+                    pending_status_requests: HashMap::new(),
+                    pending_recovery_chunks: HashMap::new(),
+                    slot_to_number: HashMap::new(),
+                    recovery_target_number: None,
+                    recovery_target_block: None,
                     last_emitted_number: None,
                     last_emitted_slot: None,
                     buffered: BTreeMap::new(),
-                    connected_peers: HashSet::new(),
-                    peer_statuses: HashMap::new(),
-                    recovery: None,
                     next_request_id: 1,
+                    network_handle,
+                    audit_log: P2pAuditLogger::new(log_path),
                 }
             }
 
@@ -377,10 +497,10 @@ mod enabled {
             pool: EmbeddedPool,
             event_tx: mpsc::Sender<MempoolEvent>,
             telemetry: Arc<RuntimeTelemetry>,
+            network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
             mut shutdown: watch::Receiver<bool>,
         ) {
             let chain_config = Arc::new(ChainConfig::mainnet());
-            let fork_phase = latest_enabled_phase(&chain_config);
             let network_dir = consensus_network_dir();
 
             if fs::create_dir_all(&network_dir).is_err() {
@@ -390,10 +510,8 @@ mod enabled {
             let mut consensus_config = ConsensusNetworkConfig::default();
             consensus_config.network_dir = Some(network_dir);
 
-            if let Some(addr) = config.listen_addr {
-                let port = addr.port();
+            if let Some(port) = config.consensus_port {
                 consensus_config.set_ipv4_listening_address(Ipv4Addr::UNSPECIFIED, port, port, port);
-                consensus_config.enr_address = (Some(Ipv4Addr::LOCALHOST), None);
             }
 
             for node in &config.bootnodes {
@@ -404,18 +522,40 @@ mod enabled {
                 }
             }
 
+            if consensus_config.boot_nodes_enr.is_empty() && consensus_config.boot_nodes_multiaddr.is_empty() {
+                for node in MAINNET_CONSENSUS_BOOTNODES {
+                    if let Ok(enr) = Enr::from_str(node) {
+                        consensus_config.boot_nodes_enr.push(enr);
+                    }
+                }
+            }
+
             if !config.discovery_v4 {
                 consensus_config.disable_discovery = true;
             }
 
             let (shutdown_tx, _) = futures_mpsc::channel(1);
             let executor = eth2_libp2p::TaskExecutor::new(shutdown_tx);
-            let fork_context = Arc::new(ForkContext::dummy::<Mainnet>(&chain_config, fork_phase));
+            
+            let genesis_time = 1606824023; // Mainnet Genesis
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_slot = if now > genesis_time { (now - genesis_time) / 12 } else { 0 };
+
+            let fork_context = Arc::new(ForkContext::new::<Mainnet>(
+                &chain_config, 
+                current_slot, 
+                MAINNET_GENESIS_VALIDATORS_ROOT
+            ));
             let custody_group_count = chain_config.custody_requirement;
+            let enr_fork_id = EnrForkId {
+                fork_digest: fork_context.current_fork_digest(),
+                next_fork_version: chain_config.version(latest_enabled_phase(&chain_config)),
+                next_fork_epoch: FAR_FUTURE_EPOCH,
+            };
             let context = Context {
                 chain_config: chain_config.clone(),
                 config: Arc::new(consensus_config),
-                enr_fork_id: EnrForkId::default(),
+                enr_fork_id,
                 fork_context: fork_context.clone(),
                 libp2p_registry: None,
             };
@@ -432,22 +572,15 @@ mod enabled {
             };
 
             service.subscribe_kind(GossipKind::BeaconBlock);
+            service.subscribe_kind(GossipKind::LightClientFinalityUpdate);
 
-            let mut state = ConsensusState::new();
+            let mut state = ConsensusState::new(network_handle, config.log_path);
 
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     event = service.next_event() => {
-                        if !handle_network_event(
-                            &mut service,
-                            &mut state,
-                            &pool,
-                            &event_tx,
-                            &telemetry,
-                            &fork_context,
-                            event,
-                        ).await {
+                        if !handle_network_event(&mut service, &mut state, &pool, &event_tx, &telemetry, &fork_context, event).await {
                             break;
                         }
                     }
@@ -465,16 +598,33 @@ mod enabled {
             event: NetworkEvent<Mainnet>,
         ) -> bool {
             match event {
-                NetworkEvent::PeerConnectedIncoming(peer_id) | NetworkEvent::PeerConnectedOutgoing(peer_id) => {
+                NetworkEvent::PeerConnectedIncoming(peer_id) => {
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), "Connected");
                     state.connected_peers.insert(peer_id);
+                    state.peer_directions.insert(peer_id, true);
+                    telemetry.record_cl_connection(peer_id.to_string(), true);
+                    telemetry.record_consensus_peer_count(state.connected_peers.len());
+                }
+                NetworkEvent::PeerConnectedOutgoing(peer_id) => {
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), "Connected");
+                    state.connected_peers.insert(peer_id);
+                    state.peer_directions.insert(peer_id, false);
+                    telemetry.record_cl_connection(peer_id.to_string(), false);
                     telemetry.record_consensus_peer_count(state.connected_peers.len());
                 }
                 NetworkEvent::PeerDisconnected(peer_id) => {
+                    state.audit_log.log("CL", "END", &peer_id.to_string(), "Disconnected");
                     state.connected_peers.remove(&peer_id);
                     state.peer_statuses.remove(&peer_id);
+                    if let Some(is_ingress) = state.peer_directions.remove(&peer_id) {
+                        telemetry.record_cl_disconnection(is_ingress);
+                    }
                     telemetry.record_consensus_peer_count(state.connected_peers.len());
                 }
                 NetworkEvent::StatusPeer(peer_id) => {
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), "StatusRequest");
+                    telemetry.record_cl_status_sent();
+                    state.pending_status_requests.insert(peer_id, std::time::Instant::now());
                     let _ = service.send_request(
                         peer_id,
                         state.next_app_request_id(),
@@ -486,6 +636,8 @@ mod enabled {
                     inbound_request_id,
                     request_type: RequestType::Status(remote),
                 } => {
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("StatusRequest {remote:?}"));
+                    telemetry.record_cl_status_received(0);
                     state.peer_statuses.insert(peer_id, remote);
                     service.send_response(
                         peer_id,
@@ -498,6 +650,11 @@ mod enabled {
                     response: Response::Status(status),
                     ..
                 } => {
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("StatusResponse {status:?}"));
+                    let latency = state.pending_status_requests.remove(&peer_id)
+                        .map(|sent| sent.elapsed().as_nanos() as u64)
+                        .unwrap_or(0);
+                    telemetry.record_cl_status_received(latency);
                     state.peer_statuses.insert(peer_id, status);
                 }
                 NetworkEvent::PubsubMessage {
@@ -507,29 +664,58 @@ mod enabled {
                     ..
                 } => {
                     service.report_message_validation_result(&source, id, MessageAcceptance::Accept);
+                    state.audit_log.log("CL", "IN ", &source.to_string(), "BeaconBlock");
+                    telemetry.record_cl_block_received();
                     if let Some(observed) = observed_block_from_beacon_block(block, source) {
-                        telemetry.record_consensus_last_block(observed.number);
+                        telemetry.record_consensus_last_block(BlockNumber(observed.number));
                         if !ingest_block(service, state, pool, event_tx, telemetry, observed).await {
                             return false;
                         }
                     }
                 }
+                NetworkEvent::PubsubMessage {
+                    id,
+                    source,
+                    message: PubsubMessage::LightClientFinalityUpdate(update),
+                    ..
+                } => {
+                    service.report_message_validation_result(&source, id, MessageAcceptance::Accept);
+                    state.audit_log.log("CL", "IN ", &source.to_string(), "FinalityUpdate");
+                    telemetry.record_cl_finality_update_received();
+                    let finalized_slot = match *update {
+                        grandine_types::combined::LightClientFinalityUpdate::Altair(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Capella(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Deneb(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Electra(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Fulu(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Gloas(u) => u.finalized_header.beacon.slot,
+                    };
+                    telemetry.record_consensus_finalized_slot(Slot(finalized_slot));
+                    
+                    // The finalized slot corresponds to a block number we should have seen.
+                    // If we haven't seen it yet, we might still be catching up, but once we do,
+                    // the depth calculation will become accurate.
+                    if let Some(&finalized_number) = state.slot_to_number.get(&finalized_slot) {
+                        telemetry.record_consensus_finalized_number(BlockNumber(finalized_number));
+                    }
+                    let _ = event_tx.send(MempoolEvent::FinalizedBlock(Slot(finalized_slot)));
+                }
                 NetworkEvent::ResponseReceived {
+                    peer_id,
                     response: Response::BlocksByRange(block),
                     app_request_id: AppRequestId::Application(request_id),
                     ..
                 } => {
-                    if let Some(recovery) = &state.recovery {
-                        if recovery.request_id != request_id {
-                            return true;
-                        }
-                    } else {
-                        return true;
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("BlocksByRangeResponse id={request_id} count={}", block.is_some() as usize));
+                    
+                    if let Some(chunk) = state.pending_recovery_chunks.get(&request_id) {
+                        let latency = chunk.sent_at.elapsed().as_nanos() as u64;
+                        telemetry.record_cl_blocks_by_range_response_received(latency);
                     }
 
                     match block {
                         Some(block) => {
-                            if let Some(observed) = observed_block_from_beacon_block(block, PeerId::random()) {
+                            if let Some(observed) = observed_block_from_beacon_block(block, peer_id) {
                                 if let Some(last) = state.last_emitted_number {
                                     if observed.number > last {
                                         state.buffered.entry(observed.number).or_insert(observed);
@@ -538,29 +724,23 @@ mod enabled {
                             }
                         }
                         None => {
-                            if !complete_recovery(state, pool, event_tx, telemetry).await {
-                                return false;
+                            state.pending_recovery_chunks.remove(&request_id);
+                            if state.pending_recovery_chunks.is_empty() {
+                                if !drain_buffered_blocks(state, event_tx, telemetry).await {
+                                    return false;
+                                }
+                                if let Some(target) = state.recovery_target_number {
+                                    if state.last_emitted_number.is_some_and(|n| n >= target) {
+                                        state.recovery_target_number = None;
+                                        state.recovery_target_block = None;
+                                    }
+                                }
                             }
-                        }
-                    }
-                }
-                NetworkEvent::RPCFailed {
-                    app_request_id: AppRequestId::Application(request_id),
-                    ..
-                } => {
-                    if state
-                        .recovery
-                        .as_ref()
-                        .is_some_and(|recovery| recovery.request_id == request_id)
-                    {
-                        if !reset_from_recovery_target(state, pool, event_tx, telemetry).await {
-                            return false;
                         }
                     }
                 }
                 _ => {}
             }
-
             true
         }
 
@@ -588,124 +768,70 @@ mod enabled {
 
             state.buffered.entry(observed.number).or_insert(observed.clone());
 
-            if state.recovery.is_none() {
+            if state.pending_recovery_chunks.is_empty() {
                 let last_slot = state.last_emitted_slot.unwrap_or(observed.slot);
                 let slot_gap = observed.slot.saturating_sub(last_slot);
 
-                if slot_gap == 0 || slot_gap > MAX_RECOVERY_RANGE {
+                if slot_gap == 0 || slot_gap > 1024 {
                     return reset_with_anchor(state, pool, event_tx, telemetry, observed).await;
                 }
 
-                let request_id = match state.next_app_request_id() {
-                    AppRequestId::Application(id) => id,
-                    AppRequestId::Internal => unreachable!("application ids are generated locally"),
-                };
+                state.recovery_target_number = Some(observed.number);
+                state.recovery_target_block = Some(observed.clone());
 
-                let request = RequestType::BlocksByRange(OldBlocksByRangeRequest::new(
-                    last_slot.saturating_add(1),
-                    slot_gap,
-                    1,
-                ));
-
-                if service
-                    .send_request(
-                        observed.source,
-                        AppRequestId::Application(request_id),
-                        request,
-                    )
-                    .is_err()
-                {
+                let available_peers: Vec<PeerId> = state.connected_peers.iter().cloned().collect();
+                if available_peers.is_empty() {
                     return reset_with_anchor(state, pool, event_tx, telemetry, observed).await;
                 }
 
-                state.recovery = Some(RecoveryRequest {
-                    request_id,
-                    target_number: observed.number,
-                    target_block: observed,
-                });
+                const MAX_CHUNK_SIZE: u64 = 128;
+                let mut current_slot = last_slot + 1;
+                let mut remaining_count = slot_gap;
+                let mut peer_idx = 0;
+
+                while remaining_count > 0 {
+                    let count = remaining_count.min(MAX_CHUNK_SIZE);
+                    let peer_id = available_peers[peer_idx % available_peers.len()];
+                    peer_idx += 1;
+
+                    let request_id = match state.next_app_request_id() {
+                        AppRequestId::Application(id) => id,
+                        _ => unreachable!(),
+                    };
+
+                    let request = RequestType::BlocksByRange(OldBlocksByRangeRequest::new(current_slot, count, 1));
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), &format!("BlocksByRangeRequest id={request_id} from={current_slot} count={count}"));
+                    telemetry.record_cl_blocks_by_range_request_sent();
+
+                    if service.send_request(peer_id, AppRequestId::Application(request_id), request).is_ok() {
+                        state.pending_recovery_chunks.insert(request_id, RecoveryChunk {
+                            request_id, start_slot: current_slot, count, peer_id,
+                            sent_at: std::time::Instant::now(), retries: 0,
+                        });
+                    }
+                    current_slot += count;
+                    remaining_count -= count;
+                }
             }
-
             true
         }
 
-        async fn complete_recovery(
+        async fn drain_buffered_blocks(
             state: &mut ConsensusState,
-            pool: &EmbeddedPool,
             event_tx: &mpsc::Sender<MempoolEvent>,
             telemetry: &Arc<RuntimeTelemetry>,
         ) -> bool {
-            let Some(recovery) = state.recovery.take() else {
-                return true;
-            };
-
-            let before = state.last_emitted_number.unwrap_or_default();
-            let drained = drain_buffered_blocks(state, event_tx, telemetry).await;
-            if !drained {
-                return false;
-            }
-
-            if state.last_emitted_number.unwrap_or_default() >= recovery.target_number {
-                let recovered = state
-                    .last_emitted_number
-                    .unwrap_or_default()
-                    .saturating_sub(before);
-                if recovered > 0 {
-                    telemetry.record_consensus_recovered_blocks(recovered);
+            while let Some(last) = state.last_emitted_number {
+                let next = last + 1;
+                if let Some(observed) = state.buffered.remove(&next) {
+                    if !emit_block(state, event_tx, telemetry, observed).await {
+                        return false;
+                    }
+                } else {
+                    break;
                 }
-                return true;
             }
-
-            reset_with_anchor(state, pool, event_tx, telemetry, recovery.target_block).await
-        }
-
-        async fn emit_anchor(
-            state: &mut ConsensusState,
-            pool: &EmbeddedPool,
-            event_tx: &mpsc::Sender<MempoolEvent>,
-            telemetry: &Arc<RuntimeTelemetry>,
-            anchor: ObservedBlock,
-        ) -> bool {
-            if event_tx
-                .send(MempoolEvent::Reset(TrackerReset {
-                    base_fee: anchor.update.new_base_fee,
-                    gas_limit: anchor.update.gas_limit,
-                }))
-                .is_err()
-            {
-                return false;
-            }
-
-            if !replay_pool_snapshot(pool, event_tx).await {
-                return false;
-            }
-
-            state.buffered.clear();
-            emit_block(state, event_tx, telemetry, anchor).await
-        }
-
-        async fn reset_with_anchor(
-            state: &mut ConsensusState,
-            pool: &EmbeddedPool,
-            event_tx: &mpsc::Sender<MempoolEvent>,
-            telemetry: &Arc<RuntimeTelemetry>,
-            anchor: ObservedBlock,
-        ) -> bool {
-            telemetry.record_consensus_gap_reset();
-            state.recovery = None;
-            emit_anchor(state, pool, event_tx, telemetry, anchor).await
-        }
-
-        async fn reset_from_recovery_target(
-            state: &mut ConsensusState,
-            pool: &EmbeddedPool,
-            event_tx: &mpsc::Sender<MempoolEvent>,
-            telemetry: &Arc<RuntimeTelemetry>,
-        ) -> bool {
-            let Some(recovery) = state.recovery.take() else {
-                return true;
-            };
-
-            reset_with_anchor(state, pool, event_tx, telemetry, recovery.target_block).await
+            true
         }
 
         async fn emit_block(
@@ -717,71 +843,77 @@ mod enabled {
             let tx_count = block.update.included_txs.len();
             let gas_used = block.update.gas_used;
             let block_number = block.number;
-            let next_expected = block.number.saturating_add(1);
+
+            state.network_handle.update_status(Head {
+                number: block_number,
+                hash: block.hash,
+                difficulty: U256::ZERO,
+                total_difficulty: U256::ZERO,
+                timestamp: 0,
+            });
 
             if event_tx.send(MempoolEvent::NewBlock(block.update)).is_err() {
                 return false;
             }
 
             telemetry.record_block(tx_count, gas_used);
-            telemetry.record_consensus_last_block(block_number);
-            telemetry.record_consensus_next_expected(next_expected);
-            if state.last_emitted_number.is_none() {
-                telemetry.record_consensus_anchor(block_number);
-            }
-
             state.last_emitted_number = Some(block_number);
             state.last_emitted_slot = Some(block.slot);
+            state.slot_to_number.insert(block.slot, block_number);
+            if state.slot_to_number.len() > 1024 {
+                let oldest = block.slot.saturating_sub(1024);
+                state.slot_to_number.retain(|&s, _| s > oldest);
+            }
             true
         }
 
-        async fn drain_buffered_blocks(
+        async fn emit_anchor(
             state: &mut ConsensusState,
+            _pool: &EmbeddedPool,
             event_tx: &mpsc::Sender<MempoolEvent>,
             telemetry: &Arc<RuntimeTelemetry>,
+            anchor: ObservedBlock,
         ) -> bool {
-            loop {
-                let Some(next_expected) = state.last_emitted_number.map(|number| number + 1) else {
-                    return true;
-                };
-                let Some(block) = state.buffered.remove(&next_expected) else {
-                    return true;
-                };
-
-                if !emit_block(state, event_tx, telemetry, block).await {
-                    return false;
-                }
+            let future_blocks = state.buffered.values().cloned().map(|b| b.update).collect();
+            if event_tx.send(MempoolEvent::Prune(TrackerPrune {
+                anchor: anchor.update.clone(),
+                future_blocks,
+            })).is_err() {
+                return false;
             }
+
+            telemetry.record_consensus_anchor(BlockNumber(anchor.number));
+            telemetry.record_consensus_last_block(BlockNumber(anchor.number));
+            telemetry.record_consensus_next_expected(BlockNumber(anchor.number + 1));
+
+            state.last_emitted_number = Some(anchor.number);
+            state.last_emitted_slot = Some(anchor.slot);
+            state.pending_recovery_chunks.clear();
+            state.recovery_target_number = None;
+            state.recovery_target_block = None;
+
+            drain_buffered_blocks(state, event_tx, telemetry).await
         }
 
-        fn latest_enabled_phase(chain_config: &ChainConfig) -> Phase {
-            for phase in [
-                Phase::Gloas,
-                Phase::Fulu,
-                Phase::Electra,
-                Phase::Deneb,
-                Phase::Capella,
-                Phase::Bellatrix,
-                Phase::Altair,
-                Phase::Phase0,
-            ] {
-                if chain_config.is_phase_enabled::<Mainnet>(phase) {
-                    return phase;
-                }
-            }
-
-            Phase::Phase0
+        async fn reset_with_anchor(
+            state: &mut ConsensusState,
+            pool: &EmbeddedPool,
+            event_tx: &mpsc::Sender<MempoolEvent>,
+            telemetry: &Arc<RuntimeTelemetry>,
+            anchor: ObservedBlock,
+        ) -> bool {
+            telemetry.record_consensus_gap_reset();
+            emit_anchor(state, pool, event_tx, telemetry, anchor).await
         }
 
         fn local_status(state: &ConsensusState, fork_context: &ForkContext) -> StatusMessage {
             let head_slot = state.last_emitted_slot.unwrap_or_default();
             let earliest_available_slot = state.last_emitted_slot.unwrap_or_default();
-
             StatusMessage::V2(StatusMessageV2 {
                 fork_digest: fork_context.current_fork_digest(),
-                finalized_root: grandine_types::phase0::primitives::H256::zero(),
+                finalized_root: MAINNET_GENESIS_VALIDATORS_ROOT,
                 finalized_epoch: 0,
-                head_root: grandine_types::phase0::primitives::H256::zero(),
+                head_root: MAINNET_GENESIS_VALIDATORS_ROOT,
                 head_slot,
                 earliest_available_slot,
             })
@@ -793,9 +925,11 @@ mod enabled {
         ) -> Option<ObservedBlock> {
             let slot = block.message().slot();
             let payload = block.as_ref().clone().execution_payload()?;
-            let (number, gas_used, gas_limit, new_base_fee, included_txs) = match payload {
+            let (number, hash, parent_hash, gas_used, gas_limit, new_base_fee, included_txs) = match payload {
                 CombinedExecutionPayload::Bellatrix(payload) => (
                     payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
                     payload.gas_used,
                     payload.gas_limit,
                     payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
@@ -803,6 +937,8 @@ mod enabled {
                 ),
                 CombinedExecutionPayload::Capella(payload) => (
                     payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
                     payload.gas_used,
                     payload.gas_limit,
                     payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
@@ -810,6 +946,8 @@ mod enabled {
                 ),
                 CombinedExecutionPayload::Deneb(payload) => (
                     payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
                     payload.gas_used,
                     payload.gas_limit,
                     payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
@@ -818,38 +956,32 @@ mod enabled {
             };
 
             Some(ObservedBlock {
-                number,
-                slot,
-                update: BlockUpdate {
-                    included_txs,
-                    new_base_fee,
-                    gas_used,
-                    gas_limit,
-                },
-                source,
+                number, hash, slot, source,
+                update: BlockUpdate { number: BlockNumber(number), hash: ExecutionHash::from(hash.0), parent_hash: ExecutionHash::from(parent_hash.0), included_txs, new_base_fee, gas_used, gas_limit },
             })
         }
 
         fn decode_payload_transactions<'a>(
-            transactions: impl Iterator<
-                Item = &'a grandine_types::bellatrix::primitives::Transaction<Mainnet>,
-            >,
+            txs: impl Iterator<Item = &'a grandine_types::bellatrix::primitives::Transaction<Mainnet>>,
         ) -> Vec<PendingTx> {
-            transactions
-                .filter_map(
-                    |raw: &'a grandine_types::bellatrix::primitives::Transaction<Mainnet>| {
-                        TransactionSigned::decode_2718_exact(raw.as_bytes()).ok()
-                    },
-                )
-                .filter_map(|tx| pending_tx_from_signed(&tx))
-                .collect()
+            txs.filter_map(|tx_bytes| {
+                let tx = TransactionSigned::decode_2718(&mut tx_bytes.as_bytes()).ok()?;
+                pending_tx_from_signed(&tx)
+            })
+            .collect()
+        }
+
+        fn latest_enabled_phase(config: &ChainConfig) -> Phase {
+            if config.fulu_fork_epoch != FAR_FUTURE_EPOCH { Phase::Fulu }
+            else if config.deneb_fork_epoch != FAR_FUTURE_EPOCH { Phase::Deneb }
+            else if config.capella_fork_epoch != FAR_FUTURE_EPOCH { Phase::Capella }
+            else if config.bellatrix_fork_epoch != FAR_FUTURE_EPOCH { Phase::Bellatrix }
+            else if config.altair_fork_epoch != FAR_FUTURE_EPOCH { Phase::Altair }
+            else { Phase::Phase0 }
         }
 
         fn consensus_network_dir() -> PathBuf {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             std::env::temp_dir().join(format!("mempooloracle-consensus-{unique}"))
         }
     }
@@ -860,11 +992,3 @@ mod enabled {
 
 #[cfg(feature = "reth-p2p")]
 pub use enabled::connect_with_config;
-
-#[cfg(not(feature = "reth-p2p"))]
-pub async fn connect_with_config(
-    _config: crate::P2pTransportConfig,
-    _tracker_config: crate::TrackerConfig,
-) -> Result<crate::TrackerRuntime, crate::TrackerError> {
-    Err(crate::TrackerError::FeatureDisabled("reth-p2p"))
-}

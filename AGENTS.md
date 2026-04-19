@@ -41,3 +41,15 @@ Use these Context7 IDs when retrieving official docs/examples:
 - `solana-labs/solana`
 - `websites/rs_solana-sdk_solana_sdk`
 - `anza-xyz/solana-sdk`
+
+Testing and Development
+-----------------------
+The canonical command for running manual P2P tests is located in the `test.sh`
+script in the repository root. This script must always be kept up to date
+whenever the required features, environment variables, or CLI arguments change.
+
+Run it with:
+```bash
+./test.sh
+```
+Additional arguments passed to `./test.sh` will be forwarded to the `cli_tool` example.

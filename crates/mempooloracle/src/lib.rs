@@ -3,11 +3,15 @@ mod runtime;
 mod transport;
 
 use alloy::providers::fillers::TxFiller;
+use alloy::primitives::B256;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, RwLock, mpsc::Receiver};
+use std::time::SystemTime;
 
-pub use runtime::{TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind};
+pub use runtime::{
+    init_metrics, TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind,
+};
 use transport::{p2p, rpc};
 
 pub type AlloyTrackerRuntime = TrackerRuntime;
@@ -31,7 +35,10 @@ pub struct P2pTransportConfig {
     pub bootnodes: Vec<String>,
     pub discovery_v4: bool,
     pub listen_addr: Option<std::net::SocketAddr>,
+    pub execution_port: Option<u16>,
+    pub consensus_port: Option<u16>,
     pub block_transport: P2pBlockTransport,
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,9 +73,62 @@ pub enum TrackerError {
 
 pub type AlloyTrackerError = TrackerError;
 
+/// A Consensus Layer slot number.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Slot(pub u64);
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// An Execution Layer block number.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct BlockNumber(pub u64);
+
+impl std::fmt::Display for BlockNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::ops::Add<u64> for BlockNumber {
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self::Output {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for BlockNumber {
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self::Output {
+        Self(self.0.saturating_sub(rhs))
+    }
+}
+
+/// A Consensus Layer block or state root.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct BeaconHash(pub [u8; 32]);
+
+/// An Execution Layer block or transaction hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionHash(pub [u8; 32]);
+
+impl From<[u8; 32]> for ExecutionHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<alloy::primitives::FixedBytes<32>> for ExecutionHash {
+    fn from(bytes: alloy::primitives::FixedBytes<32>) -> Self {
+        Self(bytes.0)
+    }
+}
+
 /// A unique identifier for a transaction.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct TxId(pub [u8; 32]);
+pub type TxId = ExecutionHash;
 
 /// A unique identifier for an account.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -79,19 +139,21 @@ pub struct Address(pub [u8; 20]);
 pub enum MempoolEvent {
     /// A new transaction has entered the mempool.
     PendingTransaction(PendingTx),
-    /// The tracker must discard all state and restart from a fresh anchor.
-    Reset(TrackerReset),
+    /// The tracker must discard some state and restart from a fresh anchor.
+    Prune(TrackerPrune),
     /// A new block has been mined.
     NewBlock(BlockUpdate),
+    /// A block has been finalized.
+    FinalizedBlock(Slot),
 }
 
-/// A reset instruction for the tracker after block continuity was lost.
+/// A prune and re-anchor instruction for the tracker.
 #[derive(Debug, Clone)]
-pub struct TrackerReset {
-    /// The base fee to use for the new anchor point.
-    pub base_fee: u128,
-    /// The latest observed block gas limit to use after re-anchoring.
-    pub gas_limit: u64,
+pub struct TrackerPrune {
+    /// The fresh block to anchor to.
+    pub anchor: BlockUpdate,
+    /// Any blocks that were already seen but were ahead of the previous head.
+    pub future_blocks: Vec<BlockUpdate>,
 }
 
 /// A pending transaction in the mempool.
@@ -103,11 +165,18 @@ pub struct PendingTx {
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
     pub gas_limit: u64,
+    pub seen_at: SystemTime,
 }
 
 /// An update about a new block.
 #[derive(Debug, Clone)]
 pub struct BlockUpdate {
+    /// The block number.
+    pub number: BlockNumber,
+    /// The block hash.
+    pub hash: ExecutionHash,
+    /// The parent block hash.
+    pub parent_hash: ExecutionHash,
     /// The transactions included in the block.
     pub included_txs: Vec<PendingTx>,
     /// The new base fee for the next block.
@@ -132,6 +201,18 @@ pub struct MempoolInner {
     current_base_fee: u128,
     private_flow_ratio: f64,
     last_block_gas_limit: u64,
+    last_block_number: Option<BlockNumber>,
+    last_block_hash: Option<ExecutionHash>,
+    history: VecDeque<HistoryEntry>,
+}
+
+struct HistoryEntry {
+    block: BlockUpdate,
+    removed_txs: Vec<PendingTx>,
+    prev_base_fee: u128,
+    prev_private_flow_ratio: f64,
+    prev_last_block_gas_limit: u64,
+    prev_confirmed_nonces: HashMap<Address, u64>,
 }
 
 /// Configuration for the mempool tracker.
@@ -178,6 +259,9 @@ impl MempoolTracker {
             current_base_fee: config.initial_base_fee,
             private_flow_ratio: config.private_flow_prior,
             last_block_gas_limit: 30_000_000, // Default value, will be updated by first block
+            last_block_number: None,
+            last_block_hash: None,
+            history: VecDeque::with_capacity(32),
             config,
         };
 
@@ -245,13 +329,17 @@ impl MempoolTracker {
                     let mut inner = self.inner.write().unwrap();
                     inner.insert(tx);
                 }
-                Ok(MempoolEvent::Reset(reset)) => {
+                Ok(MempoolEvent::Prune(prune)) => {
                     let mut inner = self.inner.write().unwrap();
-                    inner.reset(reset);
+                    inner.prune_and_reanchor(prune.anchor, prune.future_blocks);
                 }
                 Ok(MempoolEvent::NewBlock(block)) => {
                     let mut inner = self.inner.write().unwrap();
                     inner.apply_block(block);
+                }
+                Ok(MempoolEvent::FinalizedBlock(number)) => {
+                    // For now we just log it or we could use it to prune old state if needed
+                    tracing::info!(block_number = number.0, "Block finalized");
                 }
                 Err(_) => break, // sender dropped, shut down cleanly
             }
@@ -260,13 +348,87 @@ impl MempoolTracker {
 }
 
 impl MempoolInner {
-    fn reset(&mut self, reset: TrackerReset) {
+    fn prune_and_reanchor(&mut self, anchor: BlockUpdate, future_blocks: Vec<BlockUpdate>) {
+        // 1. Build a map of latest nonces from the anchor block and any future blocks
+        let mut latest_nonces = HashMap::new();
+        for tx in &anchor.included_txs {
+            let entry = latest_nonces.entry(tx.sender).or_insert(0u64);
+            *entry = (*entry).max(tx.nonce + 1);
+        }
+        for block in future_blocks {
+            for tx in &block.included_txs {
+                let entry = latest_nonces.entry(tx.sender).or_insert(0u64);
+                *entry = (*entry).max(tx.nonce + 1);
+            }
+        }
+
+        // 2. Identify transactions to keep
+        let now = SystemTime::now();
+        let one_hour = std::time::Duration::from_secs(3600);
+        let mut to_keep = Vec::new();
+
+        for (addr, queue) in &self.account_queues {
+            for slot in &queue.slots {
+                if let Some(tx) = slot {
+                    let mut keep = false;
+
+                    // Keep if nonce is greater than any we've seen in the new chain head/future
+                    if let Some(&latest) = latest_nonces.get(addr) {
+                        if tx.nonce >= latest {
+                            keep = true;
+                        }
+                    } else {
+                        // Account not seen in the new blocks, keep it for now
+                        keep = true;
+                    }
+
+                    // Keep if it's been in the mempool for a long time (> 1 hour)
+                    if let Ok(age) = now.duration_since(tx.seen_at) {
+                        if age > one_hour {
+                            keep = true;
+                        }
+                    }
+
+                    // Keep if it's not paying enough for the new base fee (unlikely to have been included)
+                    if tx.max_fee_per_gas < anchor.new_base_fee {
+                        keep = true;
+                    }
+
+                    if keep {
+                        to_keep.push(tx.clone());
+                    }
+                }
+            }
+        }
+
+        // 3. Reset internal state but preserve configuration
         self.account_queues.clear();
         self.base_fee_eligibility.clear();
         self.priority_queue.clear();
-        self.current_base_fee = reset.base_fee;
-        self.private_flow_ratio = self.config.private_flow_prior;
-        self.last_block_gas_limit = reset.gas_limit;
+        self.current_base_fee = anchor.new_base_fee;
+        self.last_block_gas_limit = anchor.gas_limit;
+        self.last_block_number = Some(anchor.number);
+        self.last_block_hash = Some(anchor.hash);
+        self.history.clear();
+        
+        // Add anchor to history
+        let prev_base_fee = self.current_base_fee; // simplified
+        let prev_private_flow_ratio = self.private_flow_ratio;
+        let prev_last_block_gas_limit = self.last_block_gas_limit;
+        
+        self.history.push_back(HistoryEntry {
+            block: anchor,
+            removed_txs: Vec::new(),
+            prev_base_fee,
+            prev_private_flow_ratio,
+            prev_last_block_gas_limit,
+            prev_confirmed_nonces: HashMap::new(),
+        });
+
+        // 4. Re-insert the "kept" transactions
+        for tx in to_keep {
+            self.insert(tx);
+        }
     }
 
     fn effective_priority_fee(&self, tx: &PendingTx) -> u128 {
@@ -353,6 +515,40 @@ impl MempoolInner {
     }
 
     fn apply_block(&mut self, block: BlockUpdate) {
+        // Detect reorg
+        if let Some(last_hash) = self.last_block_hash {
+            if block.parent_hash != last_hash {
+                tracing::info!(
+                    block_number = block.number.0,
+                    "Reorg detected, parent hash mismatch"
+                );
+                self.handle_reorg(block);
+                return;
+            }
+        }
+
+        // Detect gap
+        if let Some(last_num) = self.last_block_number {
+            if block.number.0 != last_num.0 + 1 {
+                tracing::warn!(
+                    expected = last_num.0 + 1,
+                    received = block.number.0,
+                    "Non-contiguous block received"
+                );
+                // The transport layer should handle recovery/resets
+                return;
+            }
+        }
+
+        self.attach_block(block);
+    }
+
+    fn attach_block(&mut self, block: BlockUpdate) {
+        let prev_base_fee = self.current_base_fee;
+        let prev_private_flow_ratio = self.private_flow_ratio;
+        let prev_last_block_gas_limit = self.last_block_gas_limit;
+        let mut prev_confirmed_nonces = HashMap::new();
+
         // 1. Private order flow estimation
         let mut known_gas_used: u64 = 0;
         for tx in &block.included_txs {
@@ -368,11 +564,9 @@ impl MempoolInner {
 
         if block.gas_limit > 0 {
             let total_gas_used = block.gas_used;
-            // Ensure known_gas_used does not exceed total_gas_used
             let private_gas = total_gas_used.saturating_sub(known_gas_used);
             let observed_private_flow = private_gas as f64 / block.gas_limit as f64;
 
-            // EMA update
             let alpha = 0.1;
             self.private_flow_ratio =
                 alpha * observed_private_flow + (1.0 - alpha) * self.private_flow_ratio;
@@ -380,26 +574,25 @@ impl MempoolInner {
         self.last_block_gas_limit = block.gas_limit;
 
         // 2. Remove confirmed transactions from indexes and account queues
+        let mut removed_txs = Vec::new();
         for tx_in_block in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx_in_block.sender) {
                 if tx_in_block.nonce >= account_queue.confirmed_nonce {
                     let nonce_offset = (tx_in_block.nonce - account_queue.confirmed_nonce) as usize;
                     if nonce_offset < account_queue.slots.len() {
-                        // Take the transaction from the slot to get ownership and remove it from the B-Trees.
-                        // This also sets the slot to None, achieving the goal of the original code.
                         if let Some(mempool_tx) = account_queue.slots[nonce_offset].take() {
                             self.base_fee_eligibility.remove(&(
                                 mempool_tx.max_fee_per_gas,
                                 mempool_tx.sender,
                                 mempool_tx.nonce,
                             ));
-                            // The effective_priority_fee must be calculated with the *old* base_fee to find it in the priority_queue.
                             let old_effective_priority = self.effective_priority_fee(&mempool_tx);
                             self.priority_queue.remove(&(
                                 Reverse(old_effective_priority),
                                 mempool_tx.sender,
                                 mempool_tx.nonce,
                             ));
+                            removed_txs.push(mempool_tx);
                         }
                     }
                 }
@@ -410,6 +603,8 @@ impl MempoolInner {
         for tx in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx.sender) {
                 let old_confirmed_nonce = account_queue.confirmed_nonce;
+                prev_confirmed_nonces.entry(tx.sender).or_insert(old_confirmed_nonce);
+                
                 account_queue.confirmed_nonce = account_queue.confirmed_nonce.max(tx.nonce + 1);
 
                 let drain_count = (account_queue.confirmed_nonce - old_confirmed_nonce) as usize;
@@ -426,16 +621,82 @@ impl MempoolInner {
         // 4. Update base fee
         self.current_base_fee = block.new_base_fee;
 
-        // 5. Re-evaluate priority for all transactions and rebuild priority queue
-        // The base_fee_eligibility map is already up-to-date.
+        // 5. Update history and head
+        self.last_block_number = Some(block.number);
+        self.last_block_hash = Some(block.hash);
+        
+        if self.history.len() == 32 {
+            self.history.pop_front();
+        }
+        self.history.push_back(HistoryEntry {
+            block,
+            removed_txs,
+            prev_base_fee,
+            prev_private_flow_ratio,
+            prev_last_block_gas_limit,
+            prev_confirmed_nonces,
+        });
+
+        // 6. Re-evaluate priority
+        self.rebuild_priority_queue();
+    }
+
+    fn detach_block(&mut self) -> Option<Vec<PendingTx>> {
+        let entry = self.history.pop_back()?;
+        
+        // 1. Restore previous state
+        self.current_base_fee = entry.prev_base_fee;
+        self.private_flow_ratio = entry.prev_private_flow_ratio;
+        self.last_block_gas_limit = entry.prev_last_block_gas_limit;
+        
+        if let Some(new_last) = self.history.back() {
+            self.last_block_number = Some(new_last.block.number);
+            self.last_block_hash = Some(new_last.block.hash);
+        } else {
+            self.last_block_number = None;
+            self.last_block_hash = None;
+        }
+
+        // 2. Restore confirmed nonces and prepend empty slots
+        for (addr, prev_nonce) in entry.prev_confirmed_nonces {
+            if let Some(account_queue) = self.account_queues.get_mut(&addr) {
+                let current_nonce = account_queue.confirmed_nonce;
+                if current_nonce > prev_nonce {
+                    let prepend_count = (current_nonce - prev_nonce) as usize;
+                    let mut new_slots = vec![None; prepend_count];
+                    new_slots.append(&mut account_queue.slots);
+                    account_queue.slots = new_slots;
+                    account_queue.confirmed_nonce = prev_nonce;
+                }
+            }
+        }
+
+        // 3. Restore removed transactions to the correct slots
+        for tx in &entry.removed_txs {
+            if let Some(account_queue) = self.account_queues.get_mut(&tx.sender) {
+                let offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
+                if offset < account_queue.slots.len() {
+                    account_queue.slots[offset] = Some(tx.clone());
+                    
+                    // Re-insert into eligibility index
+                    self.base_fee_eligibility.insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
+                }
+            }
+        }
+        
+        // 4. Rebuild priority queue
+        self.rebuild_priority_queue();
+        
+        Some(entry.removed_txs)
+    }
+
+    fn rebuild_priority_queue(&mut self) {
         self.priority_queue.clear();
 
         for account_queue in self.account_queues.values() {
             let mut nonce_bound = false;
             for slot in account_queue.slots.iter() {
                 if let Some(tx) = slot {
-                    // No need to re-insert into base_fee_eligibility, it's already correct.
-
                     if nonce_bound {
                         continue;
                     }
@@ -453,9 +714,52 @@ impl MempoolInner {
                         nonce_bound = true;
                     }
                 } else {
-                    nonce_bound = true; // Nonce gap
+                    nonce_bound = true;
                 }
             }
+        }
+    }
+
+    fn handle_reorg(&mut self, new_block: BlockUpdate) {
+        // 1. Find common ancestor in history
+        let mut ancestor_index = None;
+        for (i, entry) in self.history.iter().enumerate().rev() {
+            if entry.block.hash == new_block.parent_hash {
+                ancestor_index = Some(i);
+                break;
+            }
+        }
+
+        let Some(index) = ancestor_index else {
+            tracing::warn!(
+                block_number = new_block.number.0,
+                parent_hash = ?new_block.parent_hash,
+                "Common ancestor not found in history, performing full reset"
+            );
+            // If we can't find the ancestor in our 32-block window, we must reset
+            self.prune_and_reanchor(new_block, vec![]);
+            return;
+        };
+
+        // 2. Detach blocks back to the common ancestor
+        let mut restore_set = HashMap::new();
+        while self.history.len() > index + 1 {
+            if let Some(removed) = self.detach_block() {
+                for tx in removed {
+                    restore_set.insert(tx.id, tx);
+                }
+            }
+        }
+
+        // 3. Attach the new block (and any others if we had them)
+        // For now we only have the one new_block that triggered this
+        self.attach_block(new_block);
+
+        // 4. Re-insert transactions from the restore set that weren't in the new block(s)
+        // attach_block already re-removed them if they were in the new block.
+        // We just need to put back what's left.
+        for (_, tx) in restore_set {
+            self.insert(tx);
         }
     }
 

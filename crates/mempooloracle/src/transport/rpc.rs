@@ -217,11 +217,15 @@ async fn run_block_subscription(
                     .unwrap_or_default() as u128;
 
                 let block_update = BlockUpdate {
+                    number: crate::BlockNumber(header.number),
+                    hash: crate::ExecutionHash::from(header.hash.0),
+                    parent_hash: crate::ExecutionHash::from(header.parent_hash.0),
                     included_txs,
                     new_base_fee,
-                    gas_used: block.header().gas_used(),
-                    gas_limit: block.header().gas_limit(),
+                    gas_used: header.gas_used,
+                    gas_limit: header.gas_limit,
                 };
+
 
                 telemetry.record_block(block_update.included_txs.len(), block_update.gas_used);
 
@@ -263,14 +267,15 @@ async fn run_pending_subscription(
 
 fn alloy_tx_to_pending_tx(tx: RpcTransaction) -> PendingTx {
     PendingTx {
-        id: crate::TxId(tx.tx_hash().into()),
-        sender: crate::Address(tx.from().into_array()),
+        id: crate::ExecutionHash::from(tx.tx_hash().0),
+        sender: crate::Address(tx.from().0.0),
         nonce: tx.nonce(),
         max_fee_per_gas: alloy::consensus::Transaction::max_fee_per_gas(&tx),
         max_priority_fee_per_gas: tx
             .max_priority_fee_per_gas()
             .unwrap_or_else(|| tx.priority_fee_or_price()),
         gas_limit: tx.gas_limit(),
+        seen_at: std::time::SystemTime::now(),
     }
 }
 

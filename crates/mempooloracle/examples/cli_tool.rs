@@ -4,7 +4,7 @@ use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
     BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation, MempoolEvent,
     MempoolHandle, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx,
-    TrackerConfig, TrackerTransport, TxId,
+    TrackerConfig, TrackerTransport, TxId, TrackerPrune, Slot, BlockNumber, ExecutionHash,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -13,9 +13,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
 };
+use alloy::primitives::B256;
 use std::{
     env, io,
-    io::IsTerminal,
+    path::PathBuf,
     process,
     sync::{
         Arc, Mutex,
@@ -28,8 +29,13 @@ use std::{
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Initialize tracing for verbose logging
+    tracing_subscriber::fmt::init();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = parse_args();
+    if let Some(port) = args.metrics_port {
+        mempooloracle::init_metrics(port).expect("failed to initialize metrics");
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let config = TrackerConfig {
         initial_base_fee: 10,
@@ -60,15 +66,21 @@ async fn main() -> io::Result<()> {
             chain,
             bootnodes,
             discovery_v4,
+            log_path,
+            execution_port,
+            consensus_port,
         } => {
             let transport = TrackerTransport::P2p(P2pTransportConfig {
                 chain,
                 bootnodes,
                 discovery_v4,
                 listen_addr: None,
+                execution_port,
+                consensus_port,
                 block_transport: P2pBlockTransport::Consensus(ConsensusTransportConfig {
                     implementation: ConsensusTransportImplementation::Eth2Libp2p,
                 }),
+                log_path,
             });
             let runtime = MempoolTracker::connect(transport, config.clone())
                 .await
@@ -106,20 +118,7 @@ async fn main() -> io::Result<()> {
 
     let handle = runtime.handle();
 
-    let result = if io::stdout().is_terminal() {
-        let terminal = ratatui::init();
-        let result = run_app(
-            terminal,
-            handle,
-            args.duration_secs,
-            stop.clone(),
-            telemetry,
-        );
-        ratatui::restore();
-        result
-    } else {
-        run_plaintext(handle, args.duration_secs, stop.clone(), telemetry)
-    };
+    let result = run_plaintext(handle, args.duration_secs, stop.clone(), telemetry);
 
     stop.store(true, Ordering::Relaxed);
     runtime.shutdown();
@@ -162,6 +161,8 @@ impl Runtime {
 struct CliArgs {
     duration_secs: u64,
     source: DataSource,
+    metrics_port: Option<u16>,
+    ttfpt: bool,
 }
 
 enum DataSource {
@@ -172,6 +173,9 @@ enum DataSource {
         chain: String,
         bootnodes: Vec<String>,
         discovery_v4: bool,
+        log_path: Option<PathBuf>,
+        execution_port: Option<u16>,
+        consensus_port: Option<u16>,
     },
     Simulated,
 }
@@ -249,6 +253,7 @@ fn run_plaintext(
     duration_secs: u64,
     stop: Arc<AtomicBool>,
     telemetry: TelemetrySource,
+    ttfpt: bool,
 ) -> io::Result<()> {
     let started_at = Instant::now();
     let deadline = (duration_secs > 0).then(|| started_at + Duration::from_secs(duration_secs));
@@ -263,15 +268,49 @@ fn run_plaintext(
 
         if last_render.elapsed() >= Duration::from_millis(500) {
             let snapshot = Snapshot::capture(&handle, &telemetry, started_at);
+
+            if ttfpt && snapshot.pending_seen > 0 {
+                println!("\nSUCCESS: First pending transaction observed!");
+                println!("Time to first pending transaction: {:?}", started_at.elapsed());
+                process::exit(0);
+            }
+
+            let unfinalized_depth = snapshot.last_block_number.0.saturating_sub(snapshot.consensus_finalized_number.0);
             println!(
-                "base_fee={} min_tip={} expected_txs={} private_flow={:.1}% blocks={} pending_seen={}",
+                "base_fee={} expected_txs={} depth={} blocks={} pending_seen={} finalized_block={} peers(el={}, cl={})",
                 snapshot.base_fee,
-                snapshot.min_tip,
                 snapshot.expected_txs,
-                snapshot.private_flow,
+                unfinalized_depth,
                 snapshot.block_count,
-                snapshot.pending_seen
+                snapshot.pending_seen,
+                snapshot.consensus_finalized_number.0,
+                snapshot.p2p_peer_count,
+                snapshot.consensus_peer_count,
             );
+            println!(
+                "  EL: txs_in={} hashes_in={} unique(in={}, out={}) conns(in={}, out={}) active(in={}, out={})",
+                snapshot.el_txs_received,
+                snapshot.el_tx_hashes_received,
+                snapshot.el_unique_peers_ingress,
+                snapshot.el_unique_peers_egress,
+                snapshot.el_connections_ingress,
+                snapshot.el_connections_egress,
+                snapshot.el_active_connections_ingress,
+                snapshot.el_active_connections_egress,
+            );
+            println!(
+                "  CL: blocks_in={} finality_in={} unique(in={}, out={}) range_req(sent={}, resp={}, lat={}ms) status(in={}, out={})",
+                snapshot.cl_blocks_received,
+                snapshot.cl_finality_updates_received,
+                snapshot.cl_unique_peers_ingress,
+                snapshot.cl_unique_peers_egress,
+                snapshot.cl_blocks_by_range_requests_sent,
+                snapshot.cl_blocks_by_range_responses_received,
+                snapshot.cl_blocks_by_range_latency_avg_ns / 1_000_000,
+                snapshot.cl_status_received,
+                snapshot.cl_status_sent,
+            );
+
             last_render = Instant::now();
         }
 
@@ -342,9 +381,10 @@ fn render_gauges(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
         .split(area);
 
@@ -376,6 +416,19 @@ fn render_gauges(frame: &mut Frame, area: Rect, app: &App) {
         .percent(snapshot.marketable_utilization.min(100) as u16)
         .label(format!("{} tracked", snapshot.marketable_count));
     frame.render_widget(marketable, chunks[2]);
+
+    let unfinalized_depth = snapshot.last_block_number.0.saturating_sub(snapshot.consensus_finalized_number.0);
+    let depth_percent = (unfinalized_depth.min(128) as f64 / 128.0 * 100.0) as u16;
+    let depth_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Unfinalized Depth"),
+        )
+        .gauge_style(Style::default().fg(Color::LightRed))
+        .percent(depth_percent)
+        .label(format!("{}", unfinalized_depth));
+    frame.render_widget(depth_gauge, chunks[3]);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -629,9 +682,38 @@ struct Snapshot {
     marketable_count: usize,
     marketable_utilization: u64,
     block_count: u64,
+    last_block_number: BlockNumber,
     pending_seen: u64,
     last_block_txs: usize,
     last_block_gas_used: u64,
+    consensus_finalized_slot: Slot,
+    consensus_finalized_number: BlockNumber,
+    p2p_peer_count: usize,
+    consensus_peer_count: usize,
+
+    // Peer metrics
+    el_connections_ingress: u64,
+    el_connections_egress: u64,
+    cl_connections_ingress: u64,
+    cl_connections_egress: u64,
+    el_unique_peers_ingress: u64,
+    el_unique_peers_egress: u64,
+    cl_unique_peers_ingress: u64,
+    cl_unique_peers_egress: u64,
+    el_active_connections_ingress: u64,
+    el_active_connections_egress: u64,
+    cl_active_connections_ingress: u64,
+    cl_active_connections_egress: u64,
+
+    el_tx_hashes_received: u64,
+    el_txs_received: u64,
+    cl_blocks_received: u64,
+    cl_finality_updates_received: u64,
+    cl_status_received: u64,
+    cl_status_sent: u64,
+    cl_blocks_by_range_requests_sent: u64,
+    cl_blocks_by_range_responses_received: u64,
+    cl_blocks_by_range_latency_avg_ns: u64,
     ranked_rows: Vec<TxRow>,
 }
 
@@ -695,9 +777,37 @@ impl Snapshot {
             marketable_count: pq.len(),
             marketable_utilization: (pq.len().min(1000) as u64 * 100) / 1000,
             block_count: telemetry.block_count,
+            last_block_number: telemetry.last_block_number,
             pending_seen: telemetry.pending_seen,
             last_block_txs: telemetry.last_block_txs,
             last_block_gas_used: telemetry.last_block_gas_used,
+            consensus_finalized_slot: telemetry.consensus_finalized_slot,
+            consensus_finalized_number: telemetry.consensus_finalized_number,
+            p2p_peer_count: telemetry.p2p_peer_count,
+            consensus_peer_count: telemetry.consensus_peer_count,
+
+            el_connections_ingress: telemetry.el_connections_ingress,
+            el_connections_egress: telemetry.el_connections_egress,
+            cl_connections_ingress: telemetry.cl_connections_ingress,
+            cl_connections_egress: telemetry.cl_connections_egress,
+            el_unique_peers_ingress: telemetry.el_unique_peers_ingress,
+            el_unique_peers_egress: telemetry.el_unique_peers_egress,
+            cl_unique_peers_ingress: telemetry.cl_unique_peers_ingress,
+            cl_unique_peers_egress: telemetry.cl_unique_peers_egress,
+            el_active_connections_ingress: telemetry.el_active_connections_ingress,
+            el_active_connections_egress: telemetry.el_active_connections_egress,
+            cl_active_connections_ingress: telemetry.cl_active_connections_ingress,
+            cl_active_connections_egress: telemetry.cl_active_connections_egress,
+
+            el_tx_hashes_received: telemetry.el_tx_hashes_received,
+            el_txs_received: telemetry.el_txs_received,
+            cl_blocks_received: telemetry.cl_blocks_received,
+            cl_finality_updates_received: telemetry.cl_finality_updates_received,
+            cl_status_received: telemetry.cl_status_received,
+            cl_status_sent: telemetry.cl_status_sent,
+            cl_blocks_by_range_requests_sent: telemetry.cl_blocks_by_range_requests_sent,
+            cl_blocks_by_range_responses_received: telemetry.cl_blocks_by_range_responses_received,
+            cl_blocks_by_range_latency_avg_ns: telemetry.cl_blocks_by_range_latency_avg_ns,
             ranked_rows,
         }
     }
@@ -718,16 +828,74 @@ struct TxRow {
 struct Telemetry {
     pending_seen: u64,
     block_count: u64,
+    last_block_number: BlockNumber,
     last_block_txs: usize,
     last_block_gas_used: u64,
+    consensus_finalized_slot: Slot,
+    consensus_finalized_number: BlockNumber,
+    p2p_peer_count: usize,
+    consensus_peer_count: usize,
+
+    // Peer metrics
+    el_connections_ingress: u64,
+    el_connections_egress: u64,
+    cl_connections_ingress: u64,
+    cl_connections_egress: u64,
+    el_unique_peers_ingress: u64,
+    el_unique_peers_egress: u64,
+    cl_unique_peers_ingress: u64,
+    cl_unique_peers_egress: u64,
+    el_active_connections_ingress: u64,
+    el_active_connections_egress: u64,
+    cl_active_connections_ingress: u64,
+    cl_active_connections_egress: u64,
+
+    el_tx_hashes_received: u64,
+    el_txs_received: u64,
+    cl_blocks_received: u64,
+    cl_finality_updates_received: u64,
+    cl_status_received: u64,
+    cl_status_sent: u64,
+    cl_blocks_by_range_requests_sent: u64,
+    cl_blocks_by_range_responses_received: u64,
+    cl_blocks_by_range_latency_avg_ns: u64,
 }
 
 #[derive(Clone, Copy, Default)]
 struct AlloyTelemetryView {
     pending_seen: u64,
     block_count: u64,
+    last_block_number: BlockNumber,
     last_block_txs: usize,
     last_block_gas_used: u64,
+    consensus_finalized_slot: Slot,
+    consensus_finalized_number: BlockNumber,
+    p2p_peer_count: usize,
+    consensus_peer_count: usize,
+
+    // Peer metrics
+    el_connections_ingress: u64,
+    el_connections_egress: u64,
+    cl_connections_ingress: u64,
+    cl_connections_egress: u64,
+    el_unique_peers_ingress: u64,
+    el_unique_peers_egress: u64,
+    cl_unique_peers_ingress: u64,
+    cl_unique_peers_egress: u64,
+    el_active_connections_ingress: u64,
+    el_active_connections_egress: u64,
+    cl_active_connections_ingress: u64,
+    cl_active_connections_egress: u64,
+
+    el_tx_hashes_received: u64,
+    el_txs_received: u64,
+    cl_blocks_received: u64,
+    cl_finality_updates_received: u64,
+    cl_status_received: u64,
+    cl_status_sent: u64,
+    cl_blocks_by_range_requests_sent: u64,
+    cl_blocks_by_range_responses_received: u64,
+    cl_blocks_by_range_latency_avg_ns: u64,
 }
 
 impl From<Telemetry> for AlloyTelemetryView {
@@ -735,8 +903,34 @@ impl From<Telemetry> for AlloyTelemetryView {
         Self {
             pending_seen: value.pending_seen,
             block_count: value.block_count,
+            last_block_number: value.last_block_number,
             last_block_txs: value.last_block_txs,
             last_block_gas_used: value.last_block_gas_used,
+            consensus_finalized_slot: value.consensus_finalized_slot,
+            consensus_finalized_number: value.consensus_finalized_number,
+            p2p_peer_count: value.p2p_peer_count,
+            consensus_peer_count: value.consensus_peer_count,
+            el_connections_ingress: value.el_connections_ingress,
+            el_connections_egress: value.el_connections_egress,
+            cl_connections_ingress: value.cl_connections_ingress,
+            cl_connections_egress: value.cl_connections_egress,
+            el_unique_peers_ingress: value.el_unique_peers_ingress,
+            el_unique_peers_egress: value.el_unique_peers_egress,
+            cl_unique_peers_ingress: value.cl_unique_peers_ingress,
+            cl_unique_peers_egress: value.cl_unique_peers_egress,
+            el_active_connections_ingress: value.el_active_connections_ingress,
+            el_active_connections_egress: value.el_active_connections_egress,
+            cl_active_connections_ingress: value.cl_active_connections_ingress,
+            cl_active_connections_egress: value.cl_active_connections_egress,
+            el_tx_hashes_received: value.el_tx_hashes_received,
+            el_txs_received: value.el_txs_received,
+            cl_blocks_received: value.cl_blocks_received,
+            cl_finality_updates_received: value.cl_finality_updates_received,
+            cl_status_received: value.cl_status_received,
+            cl_status_sent: value.cl_status_sent,
+            cl_blocks_by_range_requests_sent: value.cl_blocks_by_range_requests_sent,
+            cl_blocks_by_range_responses_received: value.cl_blocks_by_range_responses_received,
+            cl_blocks_by_range_latency_avg_ns: value.cl_blocks_by_range_latency_avg_ns,
         }
     }
 }
@@ -746,8 +940,34 @@ impl From<AlloyTrackerTelemetrySnapshot> for AlloyTelemetryView {
         Self {
             pending_seen: value.pending_seen,
             block_count: value.block_count,
+            last_block_number: value.consensus_last_block_number,
             last_block_txs: value.last_block_txs,
             last_block_gas_used: value.last_block_gas_used,
+            consensus_finalized_slot: value.consensus_finalized_slot,
+            consensus_finalized_number: value.consensus_finalized_number,
+            p2p_peer_count: value.p2p_peer_count,
+            consensus_peer_count: value.consensus_peer_count,
+            el_connections_ingress: value.el_connections_ingress,
+            el_connections_egress: value.el_connections_egress,
+            cl_connections_ingress: value.cl_connections_ingress,
+            cl_connections_egress: value.cl_connections_egress,
+            el_unique_peers_ingress: value.el_unique_peers_ingress,
+            el_unique_peers_egress: value.el_unique_peers_egress,
+            cl_unique_peers_ingress: value.cl_unique_peers_ingress,
+            cl_unique_peers_egress: value.cl_unique_peers_egress,
+            el_active_connections_ingress: value.el_active_connections_ingress,
+            el_active_connections_egress: value.el_active_connections_egress,
+            cl_active_connections_ingress: value.cl_active_connections_ingress,
+            cl_active_connections_egress: value.cl_active_connections_egress,
+            el_tx_hashes_received: value.el_tx_hashes_received,
+            el_txs_received: value.el_txs_received,
+            cl_blocks_received: value.cl_blocks_received,
+            cl_finality_updates_received: value.cl_finality_updates_received,
+            cl_status_received: value.cl_status_received,
+            cl_status_sent: value.cl_status_sent,
+            cl_blocks_by_range_requests_sent: value.cl_blocks_by_range_requests_sent,
+            cl_blocks_by_range_responses_received: value.cl_blocks_by_range_responses_received,
+            cl_blocks_by_range_latency_avg_ns: value.cl_blocks_by_range_latency_avg_ns,
         }
     }
 }
@@ -763,6 +983,11 @@ fn parse_args() -> CliArgs {
     let mut chain = String::from("mainnet");
     let mut bootnodes = Vec::new();
     let mut discovery_v4 = true;
+    let mut p2p_log_path = None;
+    let mut execution_port = None;
+    let mut consensus_port = None;
+    let mut metrics_port = None;
+    let mut ttfpt = false;
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--duration=") {
@@ -803,6 +1028,11 @@ fn parse_args() -> CliArgs {
             continue;
         }
 
+        if arg == "--ttfpt" {
+            ttfpt = true;
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--chain=") {
             chain = value.to_owned();
             continue;
@@ -831,6 +1061,42 @@ fn parse_args() -> CliArgs {
             continue;
         }
 
+        if arg == "--p2p-log-path" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --p2p-log-path");
+                print_usage_and_exit();
+            };
+            p2p_log_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if arg == "--execution-port" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --execution-port");
+                print_usage_and_exit();
+            };
+            execution_port = Some(value.parse().expect("invalid port"));
+            continue;
+        }
+
+        if arg == "--consensus-port" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --consensus-port");
+                print_usage_and_exit();
+            };
+            consensus_port = Some(value.parse().expect("invalid port"));
+            continue;
+        }
+
+        if arg == "--metrics-port" {
+            let Some(value) = args.next() else {
+                eprintln!("missing value for --metrics-port");
+                print_usage_and_exit();
+            };
+            metrics_port = Some(value.parse().expect("invalid port"));
+            continue;
+        }
+
         if arg == "--disable-discovery-v4" {
             discovery_v4 = false;
             continue;
@@ -854,6 +1120,9 @@ fn parse_args() -> CliArgs {
             chain,
             bootnodes,
             discovery_v4,
+            log_path: p2p_log_path,
+            execution_port,
+            consensus_port,
         },
         (false, false, Some(ws_url)) => DataSource::Live { ws_url },
         (false, false, None) => {
@@ -865,6 +1134,8 @@ fn parse_args() -> CliArgs {
     CliArgs {
         duration_secs,
         source,
+        metrics_port,
+        ttfpt,
     }
 }
 
@@ -904,12 +1175,13 @@ fn simulate_blockchain(
             }
 
             let tx = PendingTx {
-                id: TxId([nonce as u8; 32]),
+                id: ExecutionHash([nonce as u8; 32]),
                 sender,
                 nonce,
                 max_fee_per_gas: 15 + (nonce % 10) as u128,
                 max_priority_fee_per_gas: 1 + (nonce % 5) as u128,
                 gas_limit: 21000,
+                seen_at: std::time::SystemTime::now(),
             };
             if events.send(MempoolEvent::PendingTransaction(tx)).is_err() {
                 return;
@@ -930,12 +1202,13 @@ fn simulate_blockchain(
             .map(|i| {
                 let tx_nonce = nonce - 10 + i;
                 PendingTx {
-                    id: TxId([tx_nonce as u8; 32]),
+                    id: ExecutionHash([tx_nonce as u8; 32]),
                     sender,
                     nonce: tx_nonce,
                     max_fee_per_gas: 15 + (tx_nonce % 10) as u128,
                     max_priority_fee_per_gas: 1 + (tx_nonce % 5) as u128,
                     gas_limit: 21000,
+                    seen_at: std::time::SystemTime::now(),
                 }
             })
             .collect();
@@ -948,6 +1221,9 @@ fn simulate_blockchain(
         }
 
         let block = BlockUpdate {
+            number: BlockNumber(block_number),
+            hash: mempooloracle::ExecutionHash::from([block_number as u8; 32]),
+            parent_hash: mempooloracle::ExecutionHash::from([block_number.saturating_sub(1) as u8; 32]),
             included_txs,
             new_base_fee: 10 + (block_number % 5) as u128,
             gas_used: 21000 * block_tx_count,
