@@ -3,8 +3,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
     BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation, MempoolEvent,
-    MempoolHandle, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx,
-    TrackerConfig, TrackerTransport, TxId,
+    MempoolHandle, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig,
+    TrackerTransport, TxId,
 };
 use ratatui::{
     DefaultTerminal, Frame,
