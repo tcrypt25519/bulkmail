@@ -1,32 +1,27 @@
 //! P2P network transport for mempool tracking.
 #[cfg(feature = "reth-p2p")]
 mod enabled {
+    use alloy::consensus::Transaction as _;
     use crate::{
-        Address, BlockNumber, BlockUpdate, ExecutionHash, MempoolEvent, MempoolTracker,
-        P2pBlockTransport, P2pTransportConfig, PendingTx, Slot, TrackerConfig, TrackerError,
-        TrackerPrune, TrackerRuntime,
+        Address, BlockUpdate, MempoolEvent, MempoolTracker,
+        P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig, TrackerError,
+        TrackerPrune, TrackerRuntime, ExecutionHash, Slot, BlockNumber,
         runtime::{DEFAULT_SHUTDOWN_VALUE, RuntimeTelemetry, TransportKind},
-    };
-    use alloy::{
-        consensus::Transaction as _,
-        primitives::{B256, U256},
     };
     use futures::{StreamExt, channel::mpsc as futures_mpsc};
     use reth_ethereum::{
         TransactionSigned,
-        chainspec::{Head, MAINNET as chainspecs},
-        network::{
-            NetworkConfig, NetworkEvent, NetworkEventListenerProvider, NetworkManager,
-            events::PeerEvent,
-        },
+        network::{NetworkConfig, NetworkEvent, NetworkEventListenerProvider, NetworkManager, events::PeerEvent},
         pool::{
             CoinbaseTipOrdering, EthPooledTransaction, Pool, TransactionListenerKind,
             TransactionPool, blobstore::InMemoryBlobStore, test_utils::OkValidator,
         },
-        primitives::SignerRecoverable as _,
         provider::test_utils::NoopProvider,
+        primitives::SignerRecoverable as _,
+        chainspec::{Head, MAINNET as chainspecs},
     };
     use reth_network_peers::TrustedPeer;
+    use alloy::primitives::{B256, U256};
     use std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
@@ -35,7 +30,10 @@ mod enabled {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::{sync::watch, task::JoinHandle};
+    use tokio::{
+        sync::watch,
+        task::JoinHandle,
+    };
 
     struct P2pAuditLogger {
         file: Option<std::io::BufWriter<std::fs::File>>,
@@ -61,7 +59,10 @@ mod enabled {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                let _ = writeln!(writer, "[{now}] {layer:4} {direction:3} {peer_id} {event}");
+                let _ = writeln!(
+                    writer,
+                    "[{now}] {layer:4} {direction:3} {peer_id} {event}"
+                );
                 let _ = writer.flush();
             }
         }
@@ -140,10 +141,7 @@ mod enabled {
                 .split_with_handle();
 
             // Initial status update
-            let head_hash = B256::from_str(
-                "0x41110c60043ad922dc366d7a54a31e8b802233d095e59e139621200b1aea67f8",
-            )
-            .unwrap();
+            let head_hash = B256::from_str("0x41110c60043ad922dc366d7a54a31e8b802233d095e59e139621200b1aea67f8").unwrap();
             network_handle.update_status(Head {
                 number: 24898298,
                 hash: head_hash,
@@ -192,18 +190,18 @@ mod enabled {
                 shutdown_rx,
             ));
 
-            let mut tasks: Vec<JoinHandle<()>> = vec![
-                network_task,
-                txpool_task,
-                pending_task,
-                backfill_task,
-                peer_events_task,
-            ];
+            let mut tasks: Vec<JoinHandle<()>> =
+                vec![network_task, txpool_task, pending_task, backfill_task, peer_events_task];
 
             #[cfg(feature = "consensus-p2p")]
             tasks.push(consensus_task);
 
-            Ok(TrackerRuntime::new(handle, telemetry, shutdown_tx, tasks))
+            Ok(TrackerRuntime::new(
+                handle,
+                telemetry,
+                shutdown_tx,
+                tasks,
+            ))
         }
     }
 
@@ -221,9 +219,7 @@ mod enabled {
     }
 
     async fn run_execution_peer_event_listener(
-        network_handle: reth_ethereum::network::NetworkHandle<
-            reth_ethereum::network::EthNetworkPrimitives,
-        >,
+        network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
         telemetry: Arc<RuntimeTelemetry>,
         log_path: Option<PathBuf>,
         mut shutdown: watch::Receiver<bool>,
@@ -349,12 +345,7 @@ mod enabled {
             .collect::<Vec<_>>();
 
         telemetry.record_backfill_size(existing.len());
-        audit_log.log(
-            "EL",
-            "INF",
-            "pool",
-            &format!("BackfillStart count={}", existing.len()),
-        );
+        audit_log.log("EL", "INF", "pool", &format!("BackfillStart count={}", existing.len()));
 
         for tx in existing {
             tokio::select! {
@@ -373,7 +364,7 @@ mod enabled {
         let sender = tx.recover_signer().ok()?;
         Some(PendingTx {
             id: ExecutionHash::from(tx.tx_hash().0),
-            sender: Address(sender.0.0),
+            sender: Address(sender.0 .0),
             nonce: tx.nonce(),
             max_fee_per_gas: tx.max_fee_per_gas(),
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas().unwrap_or_default(),
@@ -407,35 +398,25 @@ mod enabled {
             Context, Enr, MessageAcceptance, NetworkConfig as ConsensusNetworkConfig, NetworkEvent,
             PeerId, PubsubMessage, Response,
             libp2p::identity::secp256k1,
-            rpc::{RequestType, StatusMessage, StatusMessageV2, methods::OldBlocksByRangeRequest},
-            service::{
-                Network as ConsensusNetwork,
-                api_types::{self, AppRequestId},
-            },
+            rpc::{RequestType, StatusMessage, StatusMessageV2},
+            rpc::methods::OldBlocksByRangeRequest,
+            service::Network as ConsensusNetwork,
+            service::api_types::{self, AppRequestId},
             types::{EnrForkId, ForkContext, GossipKind},
         };
         use grandine_types::{
-            combined::{
-                ExecutionPayload as CombinedExecutionPayload,
-                SignedBeaconBlock as CombinedSignedBeaconBlock,
-            },
+            combined::{ExecutionPayload as CombinedExecutionPayload, SignedBeaconBlock as CombinedSignedBeaconBlock},
             config::Config as ChainConfig,
             nonstandard::Phase,
-            phase0::{consts::FAR_FUTURE_EPOCH, primitives::H256},
+            phase0::{primitives::H256, consts::FAR_FUTURE_EPOCH},
             preset::Mainnet,
             traits::SignedBeaconBlock as _,
         };
-        use std::{
-            collections::{BTreeMap, HashMap, HashSet},
-            fs,
-            net::Ipv4Addr,
-            sync::Arc,
-        };
+        use std::{collections::{HashMap, BTreeMap, HashSet}, fs, net::Ipv4Addr, sync::Arc};
 
         const MAINNET_GENESIS_VALIDATORS_ROOT: H256 = H256([
-            0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f,
-            0xdd, 0x4e, 0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f,
-            0x51, 0x1b, 0xfe, 0x95,
+            0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f, 0xdd, 0x4e,
+            0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f, 0x51, 0x1b, 0xfe, 0x95
         ]);
 
         const MAINNET_CONSENSUS_BOOTNODES: &[&str] = &[
@@ -477,16 +458,13 @@ mod enabled {
             last_emitted_slot: Option<u64>,
             buffered: BTreeMap<u64, ObservedBlock>,
             next_request_id: api_types::Id,
-            network_handle:
-                reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
+            network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
             audit_log: P2pAuditLogger,
         }
 
         impl ConsensusState {
             fn new(
-                network_handle: reth_ethereum::network::NetworkHandle<
-                    reth_ethereum::network::EthNetworkPrimitives,
-                >,
+                network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
                 log_path: Option<std::path::PathBuf>,
             ) -> Self {
                 Self {
@@ -519,9 +497,7 @@ mod enabled {
             pool: EmbeddedPool,
             event_tx: mpsc::Sender<MempoolEvent>,
             telemetry: Arc<RuntimeTelemetry>,
-            network_handle: reth_ethereum::network::NetworkHandle<
-                reth_ethereum::network::EthNetworkPrimitives,
-            >,
+            network_handle: reth_ethereum::network::NetworkHandle<reth_ethereum::network::EthNetworkPrimitives>,
             mut shutdown: watch::Receiver<bool>,
         ) {
             let chain_config = Arc::new(ChainConfig::mainnet());
@@ -535,12 +511,7 @@ mod enabled {
             consensus_config.network_dir = Some(network_dir);
 
             if let Some(port) = config.consensus_port {
-                consensus_config.set_ipv4_listening_address(
-                    Ipv4Addr::UNSPECIFIED,
-                    port,
-                    port,
-                    port,
-                );
+                consensus_config.set_ipv4_listening_address(Ipv4Addr::UNSPECIFIED, port, port, port);
             }
 
             for node in &config.bootnodes {
@@ -551,9 +522,7 @@ mod enabled {
                 }
             }
 
-            if consensus_config.boot_nodes_enr.is_empty()
-                && consensus_config.boot_nodes_multiaddr.is_empty()
-            {
+            if consensus_config.boot_nodes_enr.is_empty() && consensus_config.boot_nodes_multiaddr.is_empty() {
                 for node in MAINNET_CONSENSUS_BOOTNODES {
                     if let Ok(enr) = Enr::from_str(node) {
                         consensus_config.boot_nodes_enr.push(enr);
@@ -569,20 +538,13 @@ mod enabled {
             let executor = eth2_libp2p::TaskExecutor::new(shutdown_tx);
 
             let genesis_time = 1606824023; // Mainnet Genesis
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let current_slot = if now > genesis_time {
-                (now - genesis_time) / 12
-            } else {
-                0
-            };
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_slot = if now > genesis_time { (now - genesis_time) / 12 } else { 0 };
 
             let fork_context = Arc::new(ForkContext::new::<Mainnet>(
                 &chain_config,
                 current_slot,
-                MAINNET_GENESIS_VALIDATORS_ROOT,
+                MAINNET_GENESIS_VALIDATORS_ROOT
             ));
             let custody_group_count = chain_config.custody_requirement;
             let enr_fork_id = EnrForkId {
@@ -605,8 +567,7 @@ mod enabled {
                 custody_group_count,
                 secp256k1::Keypair::generate().into(),
             )
-            .await
-            else {
+            .await else {
                 return;
             };
 
@@ -638,27 +599,21 @@ mod enabled {
         ) -> bool {
             match event {
                 NetworkEvent::PeerConnectedIncoming(peer_id) => {
-                    state
-                        .audit_log
-                        .log("CL", "IN ", &peer_id.to_string(), "Connected");
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), "Connected");
                     state.connected_peers.insert(peer_id);
                     state.peer_directions.insert(peer_id, true);
                     telemetry.record_cl_connection(peer_id.to_string(), true);
                     telemetry.record_consensus_peer_count(state.connected_peers.len());
                 }
                 NetworkEvent::PeerConnectedOutgoing(peer_id) => {
-                    state
-                        .audit_log
-                        .log("CL", "OUT", &peer_id.to_string(), "Connected");
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), "Connected");
                     state.connected_peers.insert(peer_id);
                     state.peer_directions.insert(peer_id, false);
                     telemetry.record_cl_connection(peer_id.to_string(), false);
                     telemetry.record_consensus_peer_count(state.connected_peers.len());
                 }
                 NetworkEvent::PeerDisconnected(peer_id) => {
-                    state
-                        .audit_log
-                        .log("CL", "END", &peer_id.to_string(), "Disconnected");
+                    state.audit_log.log("CL", "END", &peer_id.to_string(), "Disconnected");
                     state.connected_peers.remove(&peer_id);
                     state.peer_statuses.remove(&peer_id);
                     if let Some(is_ingress) = state.peer_directions.remove(&peer_id) {
@@ -667,13 +622,9 @@ mod enabled {
                     telemetry.record_consensus_peer_count(state.connected_peers.len());
                 }
                 NetworkEvent::StatusPeer(peer_id) => {
-                    state
-                        .audit_log
-                        .log("CL", "OUT", &peer_id.to_string(), "StatusRequest");
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), "StatusRequest");
                     telemetry.record_cl_status_sent();
-                    state
-                        .pending_status_requests
-                        .insert(peer_id, std::time::Instant::now());
+                    state.pending_status_requests.insert(peer_id, std::time::Instant::now());
                     let _ = service.send_request(
                         peer_id,
                         state.next_app_request_id(),
@@ -685,12 +636,7 @@ mod enabled {
                     inbound_request_id,
                     request_type: RequestType::Status(remote),
                 } => {
-                    state.audit_log.log(
-                        "CL",
-                        "IN ",
-                        &peer_id.to_string(),
-                        &format!("StatusRequest {remote:?}"),
-                    );
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("StatusRequest {remote:?}"));
                     telemetry.record_cl_status_received(0);
                     state.peer_statuses.insert(peer_id, remote);
                     service.send_response(
@@ -704,15 +650,8 @@ mod enabled {
                     response: Response::Status(status),
                     ..
                 } => {
-                    state.audit_log.log(
-                        "CL",
-                        "IN ",
-                        &peer_id.to_string(),
-                        &format!("StatusResponse {status:?}"),
-                    );
-                    let latency = state
-                        .pending_status_requests
-                        .remove(&peer_id)
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("StatusResponse {status:?}"));
+                    let latency = state.pending_status_requests.remove(&peer_id)
                         .map(|sent| sent.elapsed().as_nanos() as u64)
                         .unwrap_or(0);
                     telemetry.record_cl_status_received(latency);
@@ -724,19 +663,12 @@ mod enabled {
                     message: PubsubMessage::BeaconBlock(block),
                     ..
                 } => {
-                    service.report_message_validation_result(
-                        &source,
-                        id,
-                        MessageAcceptance::Accept,
-                    );
-                    state
-                        .audit_log
-                        .log("CL", "IN ", &source.to_string(), "BeaconBlock");
+                    service.report_message_validation_result(&source, id, MessageAcceptance::Accept);
+                    state.audit_log.log("CL", "IN ", &source.to_string(), "BeaconBlock");
                     telemetry.record_cl_block_received();
                     if let Some(observed) = observed_block_from_beacon_block(block, source) {
                         telemetry.record_consensus_last_block(BlockNumber(observed.number));
-                        if !ingest_block(service, state, pool, event_tx, telemetry, observed).await
-                        {
+                        if !ingest_block(service, state, pool, event_tx, telemetry, observed).await {
                             return false;
                         }
                     }
@@ -747,34 +679,16 @@ mod enabled {
                     message: PubsubMessage::LightClientFinalityUpdate(update),
                     ..
                 } => {
-                    service.report_message_validation_result(
-                        &source,
-                        id,
-                        MessageAcceptance::Accept,
-                    );
-                    state
-                        .audit_log
-                        .log("CL", "IN ", &source.to_string(), "FinalityUpdate");
+                    service.report_message_validation_result(&source, id, MessageAcceptance::Accept);
+                    state.audit_log.log("CL", "IN ", &source.to_string(), "FinalityUpdate");
                     telemetry.record_cl_finality_update_received();
                     let finalized_slot = match *update {
-                        grandine_types::combined::LightClientFinalityUpdate::Altair(u) => {
-                            u.finalized_header.beacon.slot
-                        }
-                        grandine_types::combined::LightClientFinalityUpdate::Capella(u) => {
-                            u.finalized_header.beacon.slot
-                        }
-                        grandine_types::combined::LightClientFinalityUpdate::Deneb(u) => {
-                            u.finalized_header.beacon.slot
-                        }
-                        grandine_types::combined::LightClientFinalityUpdate::Electra(u) => {
-                            u.finalized_header.beacon.slot
-                        }
-                        grandine_types::combined::LightClientFinalityUpdate::Fulu(u) => {
-                            u.finalized_header.beacon.slot
-                        }
-                        grandine_types::combined::LightClientFinalityUpdate::Gloas(u) => {
-                            u.finalized_header.beacon.slot
-                        }
+                        grandine_types::combined::LightClientFinalityUpdate::Altair(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Capella(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Deneb(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Electra(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Fulu(u) => u.finalized_header.beacon.slot,
+                        grandine_types::combined::LightClientFinalityUpdate::Gloas(u) => u.finalized_header.beacon.slot,
                     };
                     telemetry.record_consensus_finalized_slot(Slot(finalized_slot));
 
@@ -792,15 +706,7 @@ mod enabled {
                     app_request_id: AppRequestId::Application(request_id),
                     ..
                 } => {
-                    state.audit_log.log(
-                        "CL",
-                        "IN ",
-                        &peer_id.to_string(),
-                        &format!(
-                            "BlocksByRangeResponse id={request_id} count={}",
-                            block.is_some() as usize
-                        ),
-                    );
+                    state.audit_log.log("CL", "IN ", &peer_id.to_string(), &format!("BlocksByRangeResponse id={request_id} count={}", block.is_some() as usize));
 
                     if let Some(chunk) = state.pending_recovery_chunks.get(&request_id) {
                         let latency = chunk.sent_at.elapsed().as_nanos() as u64;
@@ -811,10 +717,9 @@ mod enabled {
                         Some(block) => {
                             if let Some(observed) = observed_block_from_beacon_block(block, peer_id)
                                 && let Some(last) = state.last_emitted_number
-                                && observed.number > last
-                            {
-                                state.buffered.entry(observed.number).or_insert(observed);
-                            }
+                                    && observed.number > last {
+                                        state.buffered.entry(observed.number).or_insert(observed);
+                                    }
                         }
                         None => {
                             state.pending_recovery_chunks.remove(&request_id);
@@ -823,11 +728,10 @@ mod enabled {
                                     return false;
                                 }
                                 if let Some(target) = state.recovery_target_number
-                                    && state.last_emitted_number.is_some_and(|n| n >= target)
-                                {
-                                    state.recovery_target_number = None;
-                                    state.recovery_target_block = None;
-                                }
+                                    && state.last_emitted_number.is_some_and(|n| n >= target) {
+                                        state.recovery_target_number = None;
+                                        state.recovery_target_block = None;
+                                    }
                             }
                         }
                     }
@@ -859,10 +763,7 @@ mod enabled {
                 Some(_) => {}
             }
 
-            state
-                .buffered
-                .entry(observed.number)
-                .or_insert(observed.clone());
+            state.buffered.entry(observed.number).or_insert(observed.clone());
 
             if state.pending_recovery_chunks.is_empty() {
                 let last_slot = state.last_emitted_slot.unwrap_or(observed.slot);
@@ -895,36 +796,15 @@ mod enabled {
                         _ => unreachable!(),
                     };
 
-                    let request = RequestType::BlocksByRange(OldBlocksByRangeRequest::new(
-                        current_slot,
-                        count,
-                        1,
-                    ));
-                    state.audit_log.log(
-                        "CL",
-                        "OUT",
-                        &peer_id.to_string(),
-                        &format!(
-                            "BlocksByRangeRequest id={request_id} from={current_slot} count={count}"
-                        ),
-                    );
+                    let request = RequestType::BlocksByRange(OldBlocksByRangeRequest::new(current_slot, count, 1));
+                    state.audit_log.log("CL", "OUT", &peer_id.to_string(), &format!("BlocksByRangeRequest id={request_id} from={current_slot} count={count}"));
                     telemetry.record_cl_blocks_by_range_request_sent();
 
-                    if service
-                        .send_request(peer_id, AppRequestId::Application(request_id), request)
-                        .is_ok()
-                    {
-                        state.pending_recovery_chunks.insert(
-                            request_id,
-                            RecoveryChunk {
-                                request_id,
-                                start_slot: current_slot,
-                                count,
-                                peer_id,
-                                sent_at: std::time::Instant::now(),
-                                retries: 0,
-                            },
-                        );
+                    if service.send_request(peer_id, AppRequestId::Application(request_id), request).is_ok() {
+                        state.pending_recovery_chunks.insert(request_id, RecoveryChunk {
+                            request_id, start_slot: current_slot, count, peer_id,
+                            sent_at: std::time::Instant::now(), retries: 0,
+                        });
                     }
                     current_slot += count;
                     remaining_count -= count;
@@ -992,13 +872,10 @@ mod enabled {
             anchor: ObservedBlock,
         ) -> bool {
             let future_blocks = state.buffered.values().cloned().map(|b| b.update).collect();
-            if event_tx
-                .send(MempoolEvent::Prune(TrackerPrune {
-                    anchor: anchor.update.clone(),
-                    future_blocks,
-                }))
-                .is_err()
-            {
+            if event_tx.send(MempoolEvent::Prune(TrackerPrune {
+                anchor: anchor.update.clone(),
+                future_blocks,
+            })).is_err() {
                 return false;
             }
 
@@ -1045,63 +922,39 @@ mod enabled {
         ) -> Option<ObservedBlock> {
             let slot = block.message().slot();
             let payload = block.as_ref().clone().execution_payload()?;
-            let (number, hash, parent_hash, gas_used, gas_limit, new_base_fee, included_txs) =
-                match payload {
-                    CombinedExecutionPayload::Bellatrix(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                    CombinedExecutionPayload::Capella(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                    CombinedExecutionPayload::Deneb(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                };
+            let (number, hash, parent_hash, gas_used, gas_limit, new_base_fee, included_txs) = match payload {
+                CombinedExecutionPayload::Bellatrix(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+                CombinedExecutionPayload::Capella(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+                CombinedExecutionPayload::Deneb(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload.base_fee_per_gas.into_raw().try_into().unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+            };
 
             Some(ObservedBlock {
-                number,
-                hash,
-                slot,
-                source,
-                update: BlockUpdate {
-                    number: BlockNumber(number),
-                    hash: ExecutionHash::from(hash.0),
-                    parent_hash: ExecutionHash::from(parent_hash.0),
-                    included_txs,
-                    new_base_fee,
-                    gas_used,
-                    gas_limit,
-                },
+                number, hash, slot, source,
+                update: BlockUpdate { number: BlockNumber(number), hash: ExecutionHash::from(hash.0), parent_hash: ExecutionHash::from(parent_hash.0), included_txs, new_base_fee, gas_used, gas_limit },
             })
         }
 
@@ -1116,29 +969,21 @@ mod enabled {
         }
 
         fn latest_enabled_phase(config: &ChainConfig) -> Phase {
-            if config.fulu_fork_epoch != FAR_FUTURE_EPOCH {
-                Phase::Fulu
-            } else if config.deneb_fork_epoch != FAR_FUTURE_EPOCH {
-                Phase::Deneb
-            } else if config.capella_fork_epoch != FAR_FUTURE_EPOCH {
-                Phase::Capella
-            } else if config.bellatrix_fork_epoch != FAR_FUTURE_EPOCH {
-                Phase::Bellatrix
-            } else if config.altair_fork_epoch != FAR_FUTURE_EPOCH {
-                Phase::Altair
-            } else {
-                Phase::Phase0
-            }
+            if config.fulu_fork_epoch != FAR_FUTURE_EPOCH { Phase::Fulu }
+            else if config.deneb_fork_epoch != FAR_FUTURE_EPOCH { Phase::Deneb }
+            else if config.capella_fork_epoch != FAR_FUTURE_EPOCH { Phase::Capella }
+            else if config.bellatrix_fork_epoch != FAR_FUTURE_EPOCH { Phase::Bellatrix }
+            else if config.altair_fork_epoch != FAR_FUTURE_EPOCH { Phase::Altair }
+            else { Phase::Phase0 }
         }
 
         fn consensus_network_dir() -> PathBuf {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             std::env::temp_dir().join(format!("mempooloracle-consensus-{unique}"))
         }
     }
+
+
 }
 
 #[cfg(feature = "reth-p2p")]

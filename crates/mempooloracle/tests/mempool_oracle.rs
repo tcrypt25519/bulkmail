@@ -1,9 +1,10 @@
 use mempooloracle::{
-    Address, ConsensusTransportConfig, ConsensusTransportImplementation, ExecutionHash,
-    MempoolEvent, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig,
-    TrackerTransport, TxClassification,
+    Address, MempoolEvent, MempoolTracker, PendingTx, TrackerConfig, TrackerTransport,
+    TxClassification, ExecutionHash, P2pTransportConfig, P2pBlockTransport,
+ ConsensusTransportConfig, ConsensusTransportImplementation,
 };
-use std::{sync::mpsc, time::SystemTime};
+use std::sync::mpsc;
+use std::time::SystemTime;
 
 #[cfg(test)]
 mod tests {
@@ -54,10 +55,7 @@ mod tests {
             );
         } else {
             assert!(
-                matches!(
-                    result,
-                    Err(mempooloracle::TrackerError::FeatureDisabled("reth-p2p"))
-                ),
+                matches!(result, Err(mempooloracle::TrackerError::FeatureDisabled("reth-p2p"))),
                 "p2p transport should return FeatureDisabled error when feature is not enabled"
             );
         }
