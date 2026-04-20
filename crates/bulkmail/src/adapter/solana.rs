@@ -5,12 +5,10 @@
 //!
 //! [`Sender<Sol>`]: crate::Sender
 
-use crate::{
-    Error,
-    adapter::{
-        BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
-        RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
-    },
+use crate::Error;
+use crate::adapter::{
+    BlockReceiver, ChainAdapter, ChainClient, FeeManager, PendingTransaction, ReplayProtection,
+    RetryDecision, RetryStrategy, SendOutcome, TransactionStatus,
 };
 use async_trait::async_trait;
 use solana_client::{nonblocking::rpc_client::RpcClient, pubsub_client::PubsubClient};
@@ -19,7 +17,8 @@ use solana_sdk::{
     signature::Signature, transaction::VersionedTransaction,
 };
 use solana_transaction_status::TransactionConfirmationStatus;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Solana fee parameters (placeholder).
