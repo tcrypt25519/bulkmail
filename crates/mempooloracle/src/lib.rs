@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! A tracker for EIP-1559 mempool state and transaction confirmation latency.
 mod runtime;
 mod transport;
@@ -62,6 +63,8 @@ pub enum TrackerError {
     FeatureDisabled(&'static str),
     #[error("transport unsupported: {0}")]
     UnsupportedTransport(&'static str),
+    #[error("synchronization lock poisoned")]
+    LockPoisoned,
 }
 
 pub type AlloyTrackerError = TrackerError;
@@ -231,11 +234,17 @@ impl MempoolTracker {
         loop {
             match self.rx.recv() {
                 Ok(MempoolEvent::PendingTransaction(tx)) => {
-                    let mut inner = self.inner.write().unwrap();
+                    let mut inner = match self.inner.write() {
+                        Ok(inner) => inner,
+                        Err(_) => break,
+                    };
                     inner.insert(tx);
                 }
                 Ok(MempoolEvent::NewBlock(block)) => {
-                    let mut inner = self.inner.write().unwrap();
+                    let mut inner = match self.inner.write() {
+                        Ok(inner) => inner,
+                        Err(_) => break,
+                    };
                     inner.apply_block(block);
                 }
                 Err(_) => break, // sender dropped, shut down cleanly
@@ -498,36 +507,45 @@ pub struct MempoolHandle {
 
 impl MempoolHandle {
     /// Returns the classification of a transaction.
-    pub fn classification(&self, id: &TxId) -> Option<TxClassification> {
-        let inner = self.inner.read().unwrap();
-        inner
+    pub fn classification(&self, id: &TxId) -> Result<Option<TxClassification>, TrackerError> {
+        let inner = self.inner.read().map_err(|_| TrackerError::LockPoisoned)?;
+        Ok(inner
             .find_tx_by_id(id)
             .as_ref()
-            .map(|tx| inner.classify_transaction(tx))
+            .map(|tx| inner.classify_transaction(tx)))
     }
 
     /// Estimates the number of blocks until a transaction is confirmed.
-    pub fn estimated_blocks_to_confirm(&self, id: &TxId) -> Option<u64> {
-        let inner = self.inner.read().unwrap();
-        let tx = inner.find_tx_by_id(id)?;
-        let gas_ahead = self.gas_ahead(id)?;
+    pub fn estimated_blocks_to_confirm(&self, id: &TxId) -> Result<Option<u64>, TrackerError> {
+        let inner = self.inner.read().map_err(|_| TrackerError::LockPoisoned)?;
+        let tx = match inner.find_tx_by_id(id) {
+            Some(tx) => tx,
+            None => return Ok(None),
+        };
+        let gas_ahead = match self.gas_ahead(id)? {
+            Some(gas) => gas,
+            None => return Ok(None),
+        };
 
         let usable_capacity =
             (inner.last_block_gas_limit as f64 * (1.0 - inner.private_flow_ratio)) as u64;
         if usable_capacity == 0 {
-            return Some(u64::MAX);
+            return Ok(Some(u64::MAX));
         }
 
-        Some(gas_ahead.saturating_add(tx.gas_limit) / usable_capacity)
+        Ok(Some(gas_ahead.saturating_add(tx.gas_limit) / usable_capacity))
     }
 
     /// Returns the total gas of transactions with a higher effective priority fee.
-    pub fn gas_ahead(&self, id: &TxId) -> Option<u64> {
-        let inner = self.inner.read().unwrap();
-        let tx = inner.find_tx_by_id(id)?;
+    pub fn gas_ahead(&self, id: &TxId) -> Result<Option<u64>, TrackerError> {
+        let inner = self.inner.read().map_err(|_| TrackerError::LockPoisoned)?;
+        let tx = match inner.find_tx_by_id(id) {
+            Some(tx) => tx,
+            None => return Ok(None),
+        };
 
         if inner.classify_transaction(&tx) != TxClassification::Marketable {
-            return None;
+            return Ok(None);
         }
 
         let effective_priority_fee = inner.effective_priority_fee(&tx);
@@ -540,46 +558,64 @@ impl MempoolHandle {
                 gas_ahead += tx_ahead.gas_limit;
             }
         }
-        Some(gas_ahead)
+        Ok(Some(gas_ahead))
     }
 
     /// Returns true if the transaction is currently marketable.
-    pub fn is_marketable(&self, id: &TxId) -> Option<bool> {
-        self.classification(id)
-            .map(|c| c == TxClassification::Marketable)
+    pub fn is_marketable(&self, id: &TxId) -> Result<Option<bool>, TrackerError> {
+        Ok(self
+            .classification(id)?
+            .map(|c| c == TxClassification::Marketable))
     }
 
     /// Returns the current base fee.
-    pub fn current_base_fee(&self) -> u128 {
-        self.inner.read().unwrap().current_base_fee
+    pub fn current_base_fee(&self) -> Result<u128, TrackerError> {
+        Ok(self
+            .inner
+            .read()
+            .map_err(|_| TrackerError::LockPoisoned)?
+            .current_base_fee)
     }
 
     /// Returns the current private flow ratio estimate.
-    pub fn private_flow_ratio(&self) -> f64 {
-        self.inner.read().unwrap().private_flow_ratio
+    pub fn private_flow_ratio(&self) -> Result<f64, TrackerError> {
+        Ok(self
+            .inner
+            .read()
+            .map_err(|_| TrackerError::LockPoisoned)?
+            .private_flow_ratio)
     }
 
     /// Returns the priority queue for inspection.
-    pub fn priority_queue(&self) -> Vec<(u128, Address, u64)> {
-        let inner = self.inner.read().unwrap();
-        inner
+    pub fn priority_queue(&self) -> Result<Vec<(u128, Address, u64)>, TrackerError> {
+        let inner = self.inner.read().map_err(|_| TrackerError::LockPoisoned)?;
+        Ok(inner
             .priority_queue
             .iter()
             .map(|((fee, addr, nonce), _)| (fee.0, *addr, *nonce))
-            .collect()
+            .collect())
     }
 
     /// Returns the gas limit of the last block.
-    pub fn last_block_gas_limit(&self) -> u64 {
-        self.inner.read().unwrap().last_block_gas_limit
+    pub fn last_block_gas_limit(&self) -> Result<u64, TrackerError> {
+        Ok(self
+            .inner
+            .read()
+            .map_err(|_| TrackerError::LockPoisoned)?
+            .last_block_gas_limit)
     }
 
     /// Finds a transaction by its address and nonce.
-    pub fn find_tx_by_addr_and_nonce(&self, addr: Address, nonce: u64) -> Option<PendingTx> {
-        self.inner
+    pub fn find_tx_by_addr_and_nonce(
+        &self,
+        addr: Address,
+        nonce: u64,
+    ) -> Result<Option<PendingTx>, TrackerError> {
+        Ok(self
+            .inner
             .read()
-            .unwrap()
-            .find_tx_by_addr_and_nonce(addr, nonce)
+            .map_err(|_| TrackerError::LockPoisoned)?
+            .find_tx_by_addr_and_nonce(addr, nonce))
     }
 }
 

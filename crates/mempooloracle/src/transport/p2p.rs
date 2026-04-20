@@ -270,19 +270,23 @@ mod enabled {
                                 requests: messages,
                             };
 
-                            let peer_count = {
-                                let mut guard = sessions.lock().expect("peer sessions lock poisoned");
-                                guard.insert(peer_id, session);
-                                guard.len()
+                            let peer_count = match sessions.lock() {
+                                Ok(mut guard) => {
+                                    guard.insert(peer_id, session);
+                                    guard.len()
+                                }
+                                Err(_) => break,
                             };
                             telemetry.record_p2p_peer_count(peer_count);
                         }
                         NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) |
                         NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
-                            let peer_count = {
-                                let mut guard = sessions.lock().expect("peer sessions lock poisoned");
-                                guard.remove(&peer_id);
-                                guard.len()
+                            let peer_count = match sessions.lock() {
+                                Ok(mut guard) => {
+                                    guard.remove(&peer_id);
+                                    guard.len()
+                                }
+                                Err(_) => break,
                             };
                             telemetry.record_p2p_peer_count(peer_count);
                         }
@@ -309,8 +313,10 @@ mod enabled {
                 _ = interval.tick() => {}
             }
 
-            let Some(peer) = select_peer(&sessions, next_block_number) else {
-                continue;
+            let peer = match select_peer(&sessions, next_block_number) {
+                Ok(Some(peer)) => peer,
+                Ok(None) => continue,
+                Err(_) => break,
             };
 
             let headers = match request_next_headers(&peer, next_block_number).await {
@@ -345,21 +351,21 @@ mod enabled {
     fn select_peer(
         sessions: &PeerSessions,
         next_block_number: Option<u64>,
-    ) -> Option<PeerSession<EthNetworkPrimitives>> {
-        let guard = sessions.lock().expect("peer sessions lock poisoned");
+    ) -> Result<Option<PeerSession<EthNetworkPrimitives>>, TrackerError> {
+        let guard = sessions.lock().map_err(|_| TrackerError::LockPoisoned)?;
 
         if let Some(target) = next_block_number {
-            guard
+            Ok(guard
                 .values()
                 .filter(|session| session.latest_block.is_none_or(|latest| latest + 1 >= target))
                 .cloned()
                 .max_by_key(|session| session.latest_block.unwrap_or_default())
-                .or_else(|| guard.values().next().cloned())
+                .or_else(|| guard.values().next().cloned()))
         } else {
-            guard
+            Ok(guard
                 .values()
                 .cloned()
-                .max_by_key(|session| session.latest_block.unwrap_or_default())
+                .max_by_key(|session| session.latest_block.unwrap_or_default()))
         }
     }
 
