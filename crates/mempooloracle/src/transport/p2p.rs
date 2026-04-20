@@ -1,8 +1,7 @@
 #[cfg(feature = "reth-p2p")]
 mod enabled {
     #[cfg(feature = "consensus-p2p")]
-    type ConsensusNetworkEvent =
-        eth2_libp2p::NetworkEvent<grandine_types::preset::Mainnet>;
+    type ConsensusNetworkEvent = eth2_libp2p::NetworkEvent<grandine_types::preset::Mainnet>;
 
     use crate::{
         Address, BlockUpdate, ConsensusTransportImplementation, MempoolEvent, MempoolTracker,
@@ -19,7 +18,8 @@ mod enabled {
         BlockBody, TransactionSigned,
         network::{
             EthNetworkPrimitives, NetworkConfig, NetworkEvent, NetworkEventListenerProvider,
-            NetworkManager, PeerRequest, PeerRequestSender, config::rng_secret_key,
+            NetworkManager, PeerRequest, PeerRequestSender,
+            config::rng_secret_key,
             eth_wire::{GetBlockBodies, GetBlockHeaders, HeadersDirection},
             events::PeerEvent,
         },
@@ -27,8 +27,8 @@ mod enabled {
             CoinbaseTipOrdering, EthPooledTransaction, Pool, TransactionListenerKind,
             TransactionPool, blobstore::InMemoryBlobStore, test_utils::OkValidator,
         },
-        provider::test_utils::NoopProvider,
         primitives::SignerRecoverable as _,
+        provider::test_utils::NoopProvider,
     };
     use reth_network_peers::TrustedPeer;
     use std::{
@@ -155,7 +155,13 @@ mod enabled {
             telemetry.clone(),
             shutdown_rx.clone(),
         ));
-        let mut tasks = vec![network_task, txpool_task, pending_task, backfill_task, peer_events_task];
+        let mut tasks = vec![
+            network_task,
+            txpool_task,
+            pending_task,
+            backfill_task,
+            peer_events_task,
+        ];
 
         if matches!(config.block_transport, P2pBlockTransport::ExecutionPolling) {
             tasks.push(tokio::spawn(run_block_poller(
@@ -166,12 +172,7 @@ mod enabled {
             )));
         }
 
-        Ok(TrackerRuntime::new(
-            handle,
-            telemetry,
-            shutdown_tx,
-            tasks,
-        ))
+        Ok(TrackerRuntime::new(handle, telemetry, shutdown_tx, tasks))
     }
 
     fn parse_bootnodes(bootnodes: &[String]) -> Result<Vec<TrustedPeer>, TrackerError> {
@@ -357,7 +358,11 @@ mod enabled {
         if let Some(target) = next_block_number {
             Ok(guard
                 .values()
-                .filter(|session| session.latest_block.is_none_or(|latest| latest + 1 >= target))
+                .filter(|session| {
+                    session
+                        .latest_block
+                        .is_none_or(|latest| latest + 1 >= target)
+                })
                 .cloned()
                 .max_by_key(|session| session.latest_block.unwrap_or_default())
                 .or_else(|| guard.values().next().cloned()))
@@ -404,7 +409,9 @@ mod enabled {
                 response: response_tx,
             })
             .await
-            .map_err(|err| TrackerError::Setup(format!("failed to request block headers: {err}")))?;
+            .map_err(|err| {
+                TrackerError::Setup(format!("failed to request block headers: {err}"))
+            })?;
 
         let response = time::timeout(PEER_REQUEST_TIMEOUT, response_rx)
             .await
@@ -431,7 +438,9 @@ mod enabled {
             .await
             .ok()?;
 
-        let response = time::timeout(PEER_REQUEST_TIMEOUT, response_rx).await.ok()?;
+        let response = time::timeout(PEER_REQUEST_TIMEOUT, response_rx)
+            .await
+            .ok()?;
         let response = response.ok()?.ok()?;
         response.0.into_iter().next()
     }
@@ -463,7 +472,7 @@ mod enabled {
         let sender = tx.recover_signer().ok()?;
         Some(PendingTx {
             id: TxId(tx.tx_hash().0),
-            sender: Address(sender.0 .0),
+            sender: Address(sender.0.0),
             nonce: tx.nonce(),
             max_fee_per_gas: tx.max_fee_per_gas(),
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas().unwrap_or_default(),

@@ -4,9 +4,11 @@ mod runtime;
 mod transport;
 
 use alloy::providers::fillers::TxFiller;
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock, mpsc::Receiver};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, RwLock, mpsc::Receiver},
+};
 
 pub use runtime::{TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind};
 use transport::{p2p, rpc};
@@ -533,7 +535,9 @@ impl MempoolHandle {
             return Ok(Some(u64::MAX));
         }
 
-        Ok(Some(gas_ahead.saturating_add(tx.gas_limit) / usable_capacity))
+        Ok(Some(
+            gas_ahead.saturating_add(tx.gas_limit) / usable_capacity,
+        ))
     }
 
     /// Returns the total gas of transactions with a higher effective priority fee.
