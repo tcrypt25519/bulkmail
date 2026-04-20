@@ -154,7 +154,9 @@ mod tests {
     #[test]
     fn test_telemetry_snapshot() {
         let telemetry = Arc::new(RuntimeTelemetry::new(TransportKind::P2p));
-        let tracker_telemetry = TrackerTelemetry { inner: telemetry.clone() };
+        let tracker_telemetry = TrackerTelemetry {
+            inner: telemetry.clone(),
+        };
 
         telemetry.record_backfill_size(100);
         telemetry.record_pending_seen();
