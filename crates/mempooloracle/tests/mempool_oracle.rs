@@ -48,10 +48,17 @@ mod tests {
         )
         .await;
 
-        assert!(
-            result.is_ok(),
-            "p2p transport should connect when feature is enabled"
-        );
+        if cfg!(feature = "reth-p2p") {
+            assert!(
+                result.is_ok(),
+                "p2p transport should connect when feature is enabled"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(mempooloracle::TrackerError::FeatureDisabled("reth-p2p"))),
+                "p2p transport should return FeatureDisabled error when feature is not enabled"
+            );
+        }
     }
 
     #[test]

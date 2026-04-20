@@ -4,7 +4,7 @@ use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
     BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation, MempoolEvent,
     MempoolHandle, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx,
-    TrackerConfig, TrackerTransport, TxId, TrackerPrune, Slot, BlockNumber, ExecutionHash,
+    TrackerConfig, TrackerTransport, Slot, BlockNumber, ExecutionHash,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -13,7 +13,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
 };
-use alloy::primitives::B256;
 use std::{
     env, io,
     path::PathBuf,
@@ -118,7 +117,7 @@ async fn main() -> io::Result<()> {
 
     let handle = runtime.handle();
 
-    let result = run_plaintext(handle, args.duration_secs, stop.clone(), telemetry);
+    let result = run_plaintext(handle, args.duration_secs, stop.clone(), telemetry, false);
 
     stop.store(true, Ordering::Relaxed);
     runtime.shutdown();

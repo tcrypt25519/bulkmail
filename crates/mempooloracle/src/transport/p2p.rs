@@ -3,9 +3,9 @@
 mod enabled {
     use alloy::consensus::Transaction as _;
     use crate::{
-        Address, BlockUpdate, ConsensusTransportImplementation, MempoolEvent, MempoolTracker,
+        Address, BlockUpdate, MempoolEvent, MempoolTracker,
         P2pBlockTransport, P2pTransportConfig, PendingTx, TrackerConfig, TrackerError,
-        TrackerPrune, TrackerRuntime, TxId, ExecutionHash, Slot, BlockNumber,
+        TrackerPrune, TrackerRuntime, ExecutionHash, Slot, BlockNumber,
         runtime::{DEFAULT_SHUTDOWN_VALUE, RuntimeTelemetry, TransportKind},
     };
     use futures::{StreamExt, channel::mpsc as futures_mpsc};
@@ -23,7 +23,7 @@ mod enabled {
     use reth_network_peers::TrustedPeer;
     use alloy::primitives::{B256, U256};
     use std::{
-        collections::{HashMap, HashSet, BTreeMap},
+        collections::{HashMap, HashSet},
         path::PathBuf,
         str::FromStr,
         sync::{Arc, mpsc},
@@ -84,7 +84,7 @@ mod enabled {
             ));
         }
 
-        let consensus_config = match &config.block_transport {
+        let _consensus_config = match &config.block_transport {
             P2pBlockTransport::Consensus(consensus) => consensus,
             P2pBlockTransport::ExecutionPolling => {
                 return Err(TrackerError::UnsupportedTransport(
@@ -715,13 +715,11 @@ mod enabled {
 
                     match block {
                         Some(block) => {
-                            if let Some(observed) = observed_block_from_beacon_block(block, peer_id) {
-                                if let Some(last) = state.last_emitted_number {
-                                    if observed.number > last {
+                            if let Some(observed) = observed_block_from_beacon_block(block, peer_id)
+                                && let Some(last) = state.last_emitted_number
+                                    && observed.number > last {
                                         state.buffered.entry(observed.number).or_insert(observed);
                                     }
-                                }
-                            }
                         }
                         None => {
                             state.pending_recovery_chunks.remove(&request_id);
@@ -729,12 +727,11 @@ mod enabled {
                                 if !drain_buffered_blocks(state, event_tx, telemetry).await {
                                     return false;
                                 }
-                                if let Some(target) = state.recovery_target_number {
-                                    if state.last_emitted_number.is_some_and(|n| n >= target) {
+                                if let Some(target) = state.recovery_target_number
+                                    && state.last_emitted_number.is_some_and(|n| n >= target) {
                                         state.recovery_target_number = None;
                                         state.recovery_target_block = None;
                                     }
-                                }
                             }
                         }
                     }
@@ -986,8 +983,7 @@ mod enabled {
         }
     }
 
-    #[cfg(feature = "consensus-p2p")]
-    use consensus::run_consensus_block_listener;
+
 }
 
 #[cfg(feature = "reth-p2p")]
