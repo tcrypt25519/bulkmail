@@ -146,3 +146,36 @@ impl RuntimeTelemetry {
         self.p2p_imported_txs.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_telemetry_snapshot() {
+        let telemetry = Arc::new(RuntimeTelemetry::new(TransportKind::P2p));
+        let tracker_telemetry = TrackerTelemetry { inner: telemetry.clone() };
+
+        telemetry.record_backfill_size(100);
+        telemetry.record_pending_seen();
+        telemetry.record_pending_seen();
+        telemetry.record_block(50, 1000);
+        telemetry.record_p2p_peer_count(5);
+        telemetry.record_p2p_announcement();
+        telemetry.record_p2p_announcement();
+        telemetry.record_p2p_announcement();
+        telemetry.record_p2p_import();
+
+        let snapshot = tracker_telemetry.snapshot();
+
+        assert_eq!(snapshot.transport_kind, TransportKind::P2p);
+        assert_eq!(snapshot.pending_seen, 2);
+        assert_eq!(snapshot.block_count, 1);
+        assert_eq!(snapshot.last_block_txs, 50);
+        assert_eq!(snapshot.last_block_gas_used, 1000);
+        assert_eq!(snapshot.initial_backfill_txs, 100);
+        assert_eq!(snapshot.p2p_peer_count, 5);
+        assert_eq!(snapshot.p2p_announced_txs, 3);
+        assert_eq!(snapshot.p2p_imported_txs, 1);
+    }
+}
