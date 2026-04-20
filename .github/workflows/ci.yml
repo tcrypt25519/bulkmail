@@ -29,7 +29,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0      # required for commit & rebase in shared action
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Force fetch submodules
+        run: git submodule update --init --recursive
 
       - name: Run shared Rust checks
         uses: tcrypt25519/ci/.github/actions/check-rust@main

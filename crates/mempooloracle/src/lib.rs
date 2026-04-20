@@ -3,14 +3,15 @@ mod runtime;
 mod transport;
 
 use alloy::providers::fillers::TxFiller;
-use alloy::primitives::B256;
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, RwLock, mpsc::Receiver};
-use std::time::SystemTime;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{Arc, RwLock, mpsc::Receiver},
+    time::SystemTime,
+};
 
 pub use runtime::{
-    init_metrics, TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind,
+    TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind, init_metrics,
 };
 use transport::{p2p, rpc};
 
@@ -74,7 +75,19 @@ pub enum TrackerError {
 pub type AlloyTrackerError = TrackerError;
 
 /// A Consensus Layer slot number.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Slot(pub u64);
 
 impl std::fmt::Display for Slot {
@@ -84,7 +97,19 @@ impl std::fmt::Display for Slot {
 }
 
 /// An Execution Layer block number.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BlockNumber(pub u64);
 
 impl std::fmt::Display for BlockNumber {
@@ -108,11 +133,35 @@ impl std::ops::Sub<u64> for BlockNumber {
 }
 
 /// A Consensus Layer block or state root.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BeaconHash(pub [u8; 32]);
 
 /// An Execution Layer block or transaction hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ExecutionHash(pub [u8; 32]);
 
 impl From<[u8; 32]> for ExecutionHash {
@@ -242,7 +291,16 @@ impl MempoolTracker {
     ) -> Result<TrackerRuntime, TrackerError> {
         match transport {
             TrackerTransport::Rpc(rpc_config) => rpc::connect_with_config(rpc_config, config).await,
-            TrackerTransport::P2p(p2p_config) => p2p::connect_with_config(p2p_config, config).await,
+            TrackerTransport::P2p(_p2p_config) => {
+                #[cfg(feature = "reth-p2p")]
+                {
+                    p2p::connect_with_config(_p2p_config, config).await
+                }
+                #[cfg(not(feature = "reth-p2p"))]
+                {
+                    Err(TrackerError::FeatureDisabled("reth-p2p"))
+                }
+            }
         }
     }
 
@@ -368,35 +426,33 @@ impl MempoolInner {
         let mut to_keep = Vec::new();
 
         for (addr, queue) in &self.account_queues {
-            for slot in &queue.slots {
-                if let Some(tx) = slot {
-                    let mut keep = false;
+            for tx in queue.slots.iter().flatten() {
+                let mut keep = false;
 
-                    // Keep if nonce is greater than any we've seen in the new chain head/future
-                    if let Some(&latest) = latest_nonces.get(addr) {
-                        if tx.nonce >= latest {
-                            keep = true;
-                        }
-                    } else {
-                        // Account not seen in the new blocks, keep it for now
+                // Keep if nonce is greater than any we've seen in the new chain head/future
+                if let Some(&latest) = latest_nonces.get(addr) {
+                    if tx.nonce >= latest {
                         keep = true;
                     }
+                } else {
+                    // Account not seen in the new blocks, keep it for now
+                    keep = true;
+                }
 
-                    // Keep if it's been in the mempool for a long time (> 1 hour)
-                    if let Ok(age) = now.duration_since(tx.seen_at) {
-                        if age > one_hour {
-                            keep = true;
-                        }
-                    }
+                // Keep if it's been in the mempool for a long time (> 1 hour)
+                if let Ok(age) = now.duration_since(tx.seen_at)
+                    && age > one_hour
+                {
+                    keep = true;
+                }
 
-                    // Keep if it's not paying enough for the new base fee (unlikely to have been included)
-                    if tx.max_fee_per_gas < anchor.new_base_fee {
-                        keep = true;
-                    }
+                // Keep if it's not paying enough for the new base fee (unlikely to have been included)
+                if tx.max_fee_per_gas < anchor.new_base_fee {
+                    keep = true;
+                }
 
-                    if keep {
-                        to_keep.push(tx.clone());
-                    }
+                if keep {
+                    to_keep.push(tx.clone());
                 }
             }
         }
@@ -410,12 +466,12 @@ impl MempoolInner {
         self.last_block_number = Some(anchor.number);
         self.last_block_hash = Some(anchor.hash);
         self.history.clear();
-        
+
         // Add anchor to history
         let prev_base_fee = self.current_base_fee; // simplified
         let prev_private_flow_ratio = self.private_flow_ratio;
         let prev_last_block_gas_limit = self.last_block_gas_limit;
-        
+
         self.history.push_back(HistoryEntry {
             block: anchor,
             removed_txs: Vec::new(),
@@ -516,28 +572,28 @@ impl MempoolInner {
 
     fn apply_block(&mut self, block: BlockUpdate) {
         // Detect reorg
-        if let Some(last_hash) = self.last_block_hash {
-            if block.parent_hash != last_hash {
-                tracing::info!(
-                    block_number = block.number.0,
-                    "Reorg detected, parent hash mismatch"
-                );
-                self.handle_reorg(block);
-                return;
-            }
+        if let Some(last_hash) = self.last_block_hash
+            && block.parent_hash != last_hash
+        {
+            tracing::info!(
+                block_number = block.number.0,
+                "Reorg detected, parent hash mismatch"
+            );
+            self.handle_reorg(block);
+            return;
         }
 
         // Detect gap
-        if let Some(last_num) = self.last_block_number {
-            if block.number.0 != last_num.0 + 1 {
-                tracing::warn!(
-                    expected = last_num.0 + 1,
-                    received = block.number.0,
-                    "Non-contiguous block received"
-                );
-                // The transport layer should handle recovery/resets
-                return;
-            }
+        if let Some(last_num) = self.last_block_number
+            && block.number.0 != last_num.0 + 1
+        {
+            tracing::warn!(
+                expected = last_num.0 + 1,
+                received = block.number.0,
+                "Non-contiguous block received"
+            );
+            // The transport layer should handle recovery/resets
+            return;
         }
 
         self.attach_block(block);
@@ -552,12 +608,12 @@ impl MempoolInner {
         // 1. Private order flow estimation
         let mut known_gas_used: u64 = 0;
         for tx in &block.included_txs {
-            if let Some(account_queue) = self.account_queues.get(&tx.sender) {
-                if tx.nonce >= account_queue.confirmed_nonce {
-                    let nonce_offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
-                    if let Some(Some(_)) = account_queue.slots.get(nonce_offset) {
-                        known_gas_used += tx.gas_limit;
-                    }
+            if let Some(account_queue) = self.account_queues.get(&tx.sender)
+                && tx.nonce >= account_queue.confirmed_nonce
+            {
+                let nonce_offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
+                if let Some(Some(_)) = account_queue.slots.get(nonce_offset) {
+                    known_gas_used += tx.gas_limit;
                 }
             }
         }
@@ -576,25 +632,25 @@ impl MempoolInner {
         // 2. Remove confirmed transactions from indexes and account queues
         let mut removed_txs = Vec::new();
         for tx_in_block in &block.included_txs {
-            if let Some(account_queue) = self.account_queues.get_mut(&tx_in_block.sender) {
-                if tx_in_block.nonce >= account_queue.confirmed_nonce {
-                    let nonce_offset = (tx_in_block.nonce - account_queue.confirmed_nonce) as usize;
-                    if nonce_offset < account_queue.slots.len() {
-                        if let Some(mempool_tx) = account_queue.slots[nonce_offset].take() {
-                            self.base_fee_eligibility.remove(&(
-                                mempool_tx.max_fee_per_gas,
-                                mempool_tx.sender,
-                                mempool_tx.nonce,
-                            ));
-                            let old_effective_priority = self.effective_priority_fee(&mempool_tx);
-                            self.priority_queue.remove(&(
-                                Reverse(old_effective_priority),
-                                mempool_tx.sender,
-                                mempool_tx.nonce,
-                            ));
-                            removed_txs.push(mempool_tx);
-                        }
-                    }
+            if let Some(account_queue) = self.account_queues.get_mut(&tx_in_block.sender)
+                && tx_in_block.nonce >= account_queue.confirmed_nonce
+            {
+                let nonce_offset = (tx_in_block.nonce - account_queue.confirmed_nonce) as usize;
+                if nonce_offset < account_queue.slots.len()
+                    && let Some(mempool_tx) = account_queue.slots[nonce_offset].take()
+                {
+                    self.base_fee_eligibility.remove(&(
+                        mempool_tx.max_fee_per_gas,
+                        mempool_tx.sender,
+                        mempool_tx.nonce,
+                    ));
+                    let old_effective_priority = self.effective_priority_fee(&mempool_tx);
+                    self.priority_queue.remove(&(
+                        Reverse(old_effective_priority),
+                        mempool_tx.sender,
+                        mempool_tx.nonce,
+                    ));
+                    removed_txs.push(mempool_tx);
                 }
             }
         }
@@ -603,8 +659,10 @@ impl MempoolInner {
         for tx in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx.sender) {
                 let old_confirmed_nonce = account_queue.confirmed_nonce;
-                prev_confirmed_nonces.entry(tx.sender).or_insert(old_confirmed_nonce);
-                
+                prev_confirmed_nonces
+                    .entry(tx.sender)
+                    .or_insert(old_confirmed_nonce);
+
                 account_queue.confirmed_nonce = account_queue.confirmed_nonce.max(tx.nonce + 1);
 
                 let drain_count = (account_queue.confirmed_nonce - old_confirmed_nonce) as usize;
@@ -624,7 +682,7 @@ impl MempoolInner {
         // 5. Update history and head
         self.last_block_number = Some(block.number);
         self.last_block_hash = Some(block.hash);
-        
+
         if self.history.len() == 32 {
             self.history.pop_front();
         }
@@ -643,12 +701,12 @@ impl MempoolInner {
 
     fn detach_block(&mut self) -> Option<Vec<PendingTx>> {
         let entry = self.history.pop_back()?;
-        
+
         // 1. Restore previous state
         self.current_base_fee = entry.prev_base_fee;
         self.private_flow_ratio = entry.prev_private_flow_ratio;
         self.last_block_gas_limit = entry.prev_last_block_gas_limit;
-        
+
         if let Some(new_last) = self.history.back() {
             self.last_block_number = Some(new_last.block.number);
             self.last_block_hash = Some(new_last.block.hash);
@@ -677,16 +735,17 @@ impl MempoolInner {
                 let offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
                 if offset < account_queue.slots.len() {
                     account_queue.slots[offset] = Some(tx.clone());
-                    
+
                     // Re-insert into eligibility index
-                    self.base_fee_eligibility.insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
+                    self.base_fee_eligibility
+                        .insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
                 }
             }
         }
-        
+
         // 4. Rebuild priority queue
         self.rebuild_priority_queue();
-        
+
         Some(entry.removed_txs)
     }
 
@@ -706,7 +765,7 @@ impl MempoolInner {
                         continue;
                     }
 
-                    let effective_priority_fee = self.effective_priority_fee(&tx);
+                    let effective_priority_fee = self.effective_priority_fee(tx);
                     if effective_priority_fee > 0 {
                         self.priority_queue
                             .insert((Reverse(effective_priority_fee), tx.sender, tx.nonce), ());
@@ -770,7 +829,7 @@ impl MempoolInner {
                     if tx.max_fee_per_gas < self.current_base_fee {
                         return TxClassification::NonceBound;
                     }
-                    let effective_priority_fee = self.effective_priority_fee(&tx);
+                    let effective_priority_fee = self.effective_priority_fee(tx);
                     if effective_priority_fee == 0 {
                         return TxClassification::NonceBound;
                     }
@@ -795,10 +854,10 @@ impl MempoolInner {
     fn find_tx_by_id(&self, id: &TxId) -> Option<PendingTx> {
         for account_queue in self.account_queues.values() {
             for slot in &account_queue.slots {
-                if let Some(tx) = slot {
-                    if tx.id == *id {
-                        return Some(tx.clone());
-                    }
+                if let Some(tx) = slot
+                    && tx.id == *id
+                {
+                    return Some(tx.clone());
                 }
             }
         }
@@ -806,12 +865,12 @@ impl MempoolInner {
     }
 
     fn find_tx_by_addr_and_nonce(&self, addr: Address, nonce: u64) -> Option<PendingTx> {
-        if let Some(account_queue) = self.account_queues.get(&addr) {
-            if nonce >= account_queue.confirmed_nonce {
-                let offset = (nonce - account_queue.confirmed_nonce) as usize;
-                if let Some(Some(tx)) = account_queue.slots.get(offset) {
-                    return Some(tx.clone());
-                }
+        if let Some(account_queue) = self.account_queues.get(&addr)
+            && nonce >= account_queue.confirmed_nonce
+        {
+            let offset = (nonce - account_queue.confirmed_nonce) as usize;
+            if let Some(Some(tx)) = account_queue.slots.get(offset) {
+                return Some(tx.clone());
             }
         }
         None
