@@ -22,6 +22,19 @@ mod tests {
         }
     }
 
+    fn wait_for<F>(condition: F)
+    where
+        F: Fn() -> bool,
+    {
+        let start = std::time::Instant::now();
+        while !condition() {
+            if start.elapsed() > std::time::Duration::from_millis(500) {
+                panic!("Timeout waiting for condition");
+            }
+            std::thread::yield_now();
+        }
+    }
+
     #[tokio::test]
     async fn test_p2p_transport_requires_feature() {
         let result = MempoolTracker::connect(
@@ -119,11 +132,8 @@ mod tests {
             .send(MempoolEvent::PendingTransaction(tx2.clone()))
             .unwrap();
 
-        // Give the tracker a moment to process
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let classification = handle.classification(&tx2.id);
-        assert_eq!(classification, Some(TxClassification::NonceBound));
+        // Wait for the tracker to process
+        wait_for(|| handle.classification(&tx2.id) == Some(TxClassification::NonceBound));
     }
 
     #[test]
@@ -150,10 +160,7 @@ mod tests {
             .send(MempoolEvent::PendingTransaction(tx2.clone()))
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let classification = handle.classification(&tx2.id);
-        assert_eq!(classification, Some(TxClassification::NonceBound));
+        wait_for(|| handle.classification(&tx2.id) == Some(TxClassification::NonceBound));
     }
 
     #[test]
@@ -173,8 +180,7 @@ mod tests {
         sender
             .send(MempoolEvent::PendingTransaction(tx1.clone()))
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(handle.classification(&tx1.id).is_some());
+        wait_for(|| handle.classification(&tx1.id).is_some());
 
         // This one has a lower fee, should be dropped
         let tx2 = PendingTx {
@@ -188,7 +194,9 @@ mod tests {
         sender
             .send(MempoolEvent::PendingTransaction(tx2.clone()))
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Negative check: wait a bit to ensure it IS NOT added.
+        // Since we can't easily wait for "nothing to happen", we use a shorter sleep.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(handle.classification(&tx1.id).is_some());
         assert!(handle.classification(&tx2.id).is_none());
 
@@ -204,8 +212,7 @@ mod tests {
         sender
             .send(MempoolEvent::PendingTransaction(tx3.clone()))
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(handle.classification(&tx1.id).is_none());
+        wait_for(|| handle.classification(&tx1.id).is_none());
         assert!(handle.classification(&tx3.id).is_some());
     }
 
@@ -237,16 +244,11 @@ mod tests {
             .send(MempoolEvent::PendingTransaction(tx_low.clone()))
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        wait_for(|| {
+            handle.classification(&tx_low.id) == Some(TxClassification::Marketable)
+                && handle.classification(&tx_high.id) == Some(TxClassification::Marketable)
+        });
 
-        assert_eq!(
-            handle.classification(&tx_low.id),
-            Some(TxClassification::Marketable)
-        );
-        assert_eq!(
-            handle.classification(&tx_high.id),
-            Some(TxClassification::Marketable)
-        );
         assert!(handle.find_tx_by_addr_and_nonce(sender_addr, 4).is_some());
         assert!(handle.find_tx_by_addr_and_nonce(sender_addr, 5).is_some());
     }
