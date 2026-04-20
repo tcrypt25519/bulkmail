@@ -3,19 +3,17 @@ mod runtime;
 mod transport;
 
 use alloy::providers::fillers::TxFiller;
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, HashMap, VecDeque},
-    sync::{Arc, RwLock, mpsc::Receiver},
-    time::SystemTime,
-};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, RwLock, mpsc::Receiver};
+use std::time::SystemTime;
 
 pub use runtime::{
-    TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind, init_metrics,
+    init_metrics, TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind,
 };
+use transport::rpc;
 #[cfg(feature = "reth-p2p")]
 use transport::p2p;
-use transport::rpc;
 
 pub type AlloyTrackerRuntime = TrackerRuntime;
 pub type AlloyTrackerTelemetry = TrackerTelemetry;
@@ -77,19 +75,7 @@ pub enum TrackerError {
 pub type AlloyTrackerError = TrackerError;
 
 /// A Consensus Layer slot number.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Slot(pub u64);
 
 impl std::fmt::Display for Slot {
@@ -99,19 +85,7 @@ impl std::fmt::Display for Slot {
 }
 
 /// An Execution Layer block number.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BlockNumber(pub u64);
 
 impl std::fmt::Display for BlockNumber {
@@ -135,35 +109,11 @@ impl std::ops::Sub<u64> for BlockNumber {
 }
 
 /// A Consensus Layer block or state root.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BeaconHash(pub [u8; 32]);
 
 /// An Execution Layer block or transaction hash.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionHash(pub [u8; 32]);
 
 impl From<[u8; 32]> for ExecutionHash {
@@ -293,16 +243,7 @@ impl MempoolTracker {
     ) -> Result<TrackerRuntime, TrackerError> {
         match transport {
             TrackerTransport::Rpc(rpc_config) => rpc::connect_with_config(rpc_config, config).await,
-            TrackerTransport::P2p(_p2p_config) => {
-                #[cfg(feature = "reth-p2p")]
-                {
-                    p2p::connect_with_config(_p2p_config, config).await
-                }
-                #[cfg(not(feature = "reth-p2p"))]
-                {
-                    Err(TrackerError::FeatureDisabled("reth-p2p"))
-                }
-            }
+            TrackerTransport::P2p(_p2p_config) => { #[cfg(feature = "reth-p2p")] { p2p::connect_with_config(_p2p_config, config).await } #[cfg(not(feature = "reth-p2p"))] { Err(TrackerError::FeatureDisabled("reth-p2p")) } }
         }
     }
 
@@ -428,9 +369,8 @@ impl MempoolInner {
         let mut to_keep = Vec::new();
 
         for (addr, queue) in &self.account_queues {
-            for slot in &queue.slots {
-                if let Some(tx) = slot {
-                    let mut keep = false;
+            for tx in queue.slots.iter().flatten() {
+                let mut keep = false;
 
                     // Keep if nonce is greater than any we've seen in the new chain head/future
                     if let Some(&latest) = latest_nonces.get(addr) {
@@ -444,10 +384,9 @@ impl MempoolInner {
 
                     // Keep if it's been in the mempool for a long time (> 1 hour)
                     if let Ok(age) = now.duration_since(tx.seen_at)
-                        && age > one_hour
-                    {
-                        keep = true;
-                    }
+                        && age > one_hour {
+                            keep = true;
+                        }
 
                     // Keep if it's not paying enough for the new base fee (unlikely to have been included)
                     if tx.max_fee_per_gas < anchor.new_base_fee {
@@ -457,7 +396,6 @@ impl MempoolInner {
                     if keep {
                         to_keep.push(tx.clone());
                     }
-                }
             }
         }
 
@@ -577,28 +515,26 @@ impl MempoolInner {
     fn apply_block(&mut self, block: BlockUpdate) {
         // Detect reorg
         if let Some(last_hash) = self.last_block_hash
-            && block.parent_hash != last_hash
-        {
-            tracing::info!(
-                block_number = block.number.0,
-                "Reorg detected, parent hash mismatch"
-            );
-            self.handle_reorg(block);
-            return;
-        }
+            && block.parent_hash != last_hash {
+                tracing::info!(
+                    block_number = block.number.0,
+                    "Reorg detected, parent hash mismatch"
+                );
+                self.handle_reorg(block);
+                return;
+            }
 
         // Detect gap
         if let Some(last_num) = self.last_block_number
-            && block.number.0 != last_num.0 + 1
-        {
-            tracing::warn!(
-                expected = last_num.0 + 1,
-                received = block.number.0,
-                "Non-contiguous block received"
-            );
-            // The transport layer should handle recovery/resets
-            return;
-        }
+            && block.number.0 != last_num.0 + 1 {
+                tracing::warn!(
+                    expected = last_num.0 + 1,
+                    received = block.number.0,
+                    "Non-contiguous block received"
+                );
+                // The transport layer should handle recovery/resets
+                return;
+            }
 
         self.attach_block(block);
     }
@@ -613,13 +549,12 @@ impl MempoolInner {
         let mut known_gas_used: u64 = 0;
         for tx in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get(&tx.sender)
-                && tx.nonce >= account_queue.confirmed_nonce
-            {
-                let nonce_offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
-                if let Some(Some(_)) = account_queue.slots.get(nonce_offset) {
-                    known_gas_used += tx.gas_limit;
+                && tx.nonce >= account_queue.confirmed_nonce {
+                    let nonce_offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
+                    if let Some(Some(_)) = account_queue.slots.get(nonce_offset) {
+                        known_gas_used += tx.gas_limit;
+                    }
                 }
-            }
         }
 
         if block.gas_limit > 0 {
@@ -637,35 +572,31 @@ impl MempoolInner {
         let mut removed_txs = Vec::new();
         for tx_in_block in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx_in_block.sender)
-                && tx_in_block.nonce >= account_queue.confirmed_nonce
-            {
-                let nonce_offset = (tx_in_block.nonce - account_queue.confirmed_nonce) as usize;
-                if nonce_offset < account_queue.slots.len()
-                    && let Some(mempool_tx) = account_queue.slots[nonce_offset].take()
-                {
-                    self.base_fee_eligibility.remove(&(
-                        mempool_tx.max_fee_per_gas,
-                        mempool_tx.sender,
-                        mempool_tx.nonce,
-                    ));
-                    let old_effective_priority = self.effective_priority_fee(&mempool_tx);
-                    self.priority_queue.remove(&(
-                        Reverse(old_effective_priority),
-                        mempool_tx.sender,
-                        mempool_tx.nonce,
-                    ));
-                    removed_txs.push(mempool_tx);
+                && tx_in_block.nonce >= account_queue.confirmed_nonce {
+                    let nonce_offset = (tx_in_block.nonce - account_queue.confirmed_nonce) as usize;
+                    if nonce_offset < account_queue.slots.len()
+                        && let Some(mempool_tx) = account_queue.slots[nonce_offset].take() {
+                            self.base_fee_eligibility.remove(&(
+                                mempool_tx.max_fee_per_gas,
+                                mempool_tx.sender,
+                                mempool_tx.nonce,
+                            ));
+                            let old_effective_priority = self.effective_priority_fee(&mempool_tx);
+                            self.priority_queue.remove(&(
+                                Reverse(old_effective_priority),
+                                mempool_tx.sender,
+                                mempool_tx.nonce,
+                            ));
+                            removed_txs.push(mempool_tx);
+                        }
                 }
-            }
         }
 
         // 3. Update confirmed nonces and drain slots
         for tx in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx.sender) {
                 let old_confirmed_nonce = account_queue.confirmed_nonce;
-                prev_confirmed_nonces
-                    .entry(tx.sender)
-                    .or_insert(old_confirmed_nonce);
+                prev_confirmed_nonces.entry(tx.sender).or_insert(old_confirmed_nonce);
 
                 account_queue.confirmed_nonce = account_queue.confirmed_nonce.max(tx.nonce + 1);
 
@@ -741,8 +672,7 @@ impl MempoolInner {
                     account_queue.slots[offset] = Some(tx.clone());
 
                     // Re-insert into eligibility index
-                    self.base_fee_eligibility
-                        .insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
+                    self.base_fee_eligibility.insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
                 }
             }
         }
@@ -859,10 +789,9 @@ impl MempoolInner {
         for account_queue in self.account_queues.values() {
             for slot in &account_queue.slots {
                 if let Some(tx) = slot
-                    && tx.id == *id
-                {
-                    return Some(tx.clone());
-                }
+                    && tx.id == *id {
+                        return Some(tx.clone());
+                    }
             }
         }
         None
@@ -870,13 +799,12 @@ impl MempoolInner {
 
     fn find_tx_by_addr_and_nonce(&self, addr: Address, nonce: u64) -> Option<PendingTx> {
         if let Some(account_queue) = self.account_queues.get(&addr)
-            && nonce >= account_queue.confirmed_nonce
-        {
-            let offset = (nonce - account_queue.confirmed_nonce) as usize;
-            if let Some(Some(tx)) = account_queue.slots.get(offset) {
-                return Some(tx.clone());
+            && nonce >= account_queue.confirmed_nonce {
+                let offset = (nonce - account_queue.confirmed_nonce) as usize;
+                if let Some(Some(tx)) = account_queue.slots.get(offset) {
+                    return Some(tx.clone());
+                }
             }
-        }
         None
     }
 }

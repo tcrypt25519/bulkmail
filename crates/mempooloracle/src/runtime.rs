@@ -1,14 +1,12 @@
-use crate::{BlockNumber, MempoolHandle, Slot};
-use metrics::{counter, gauge};
-use metrics_exporter_prometheus::PrometheusBuilder;
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
+use crate::{MempoolHandle, Slot, BlockNumber};
+use std::collections::HashSet;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tokio::{sync::watch, task::JoinHandle};
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub(crate) const DEFAULT_SHUTDOWN_VALUE: bool = false;
 
@@ -99,95 +97,71 @@ impl TrackerTelemetry {
             consensus_peer_count: self.inner.consensus_peer_count.load(Ordering::Relaxed),
             p2p_announced_txs: self.inner.p2p_announced_txs.load(Ordering::Relaxed),
             p2p_imported_txs: self.inner.p2p_imported_txs.load(Ordering::Relaxed),
-            consensus_anchor_block_number: BlockNumber(
-                self.inner
-                    .consensus_anchor_block_number
-                    .load(Ordering::Relaxed),
-            ),
-            consensus_next_expected_block_number: BlockNumber(
-                self.inner
-                    .consensus_next_expected_block_number
-                    .load(Ordering::Relaxed),
-            ),
-            consensus_last_block_number: BlockNumber(
-                self.inner
-                    .consensus_last_block_number
-                    .load(Ordering::Relaxed),
-            ),
+            consensus_anchor_block_number: BlockNumber(self
+                .inner
+                .consensus_anchor_block_number
+                .load(Ordering::Relaxed)),
+            consensus_next_expected_block_number: BlockNumber(self
+                .inner
+                .consensus_next_expected_block_number
+                .load(Ordering::Relaxed)),
+            consensus_last_block_number: BlockNumber(self
+                .inner
+                .consensus_last_block_number
+                .load(Ordering::Relaxed)),
             consensus_gap_resets: self.inner.consensus_gap_resets.load(Ordering::Relaxed),
             consensus_recovered_blocks: self
                 .inner
                 .consensus_recovered_blocks
                 .load(Ordering::Relaxed),
-            consensus_finalized_slot: Slot(
-                self.inner.consensus_finalized_slot.load(Ordering::Relaxed),
-            ),
-            consensus_finalized_number: BlockNumber(
-                self.inner
-                    .consensus_finalized_number
-                    .load(Ordering::Relaxed),
-            ),
+            consensus_finalized_slot: Slot(self
+                .inner
+                .consensus_finalized_slot
+                .load(Ordering::Relaxed)),
+            consensus_finalized_number: BlockNumber(self
+                .inner
+                .consensus_finalized_number
+                .load(Ordering::Relaxed)),
 
             el_connections_ingress: self.inner.el_connections_ingress.load(Ordering::Relaxed),
             el_connections_egress: self.inner.el_connections_egress.load(Ordering::Relaxed),
             cl_connections_ingress: self.inner.cl_connections_ingress.load(Ordering::Relaxed),
             cl_connections_egress: self.inner.cl_connections_egress.load(Ordering::Relaxed),
-            el_active_connections_ingress: self
-                .inner
-                .el_active_connections_ingress
-                .load(Ordering::Relaxed) as u64,
-            el_active_connections_egress: self
-                .inner
-                .el_active_connections_egress
-                .load(Ordering::Relaxed) as u64,
-            cl_active_connections_ingress: self
-                .inner
-                .cl_active_connections_ingress
-                .load(Ordering::Relaxed) as u64,
-            cl_active_connections_egress: self
-                .inner
-                .cl_active_connections_egress
-                .load(Ordering::Relaxed) as u64,
-            el_unique_peers_ingress: self.inner.el_unique_peers_ingress.lock().unwrap().len()
-                as u64,
+            el_active_connections_ingress: self.inner.el_active_connections_ingress.load(Ordering::Relaxed) as u64,
+            el_active_connections_egress: self.inner.el_active_connections_egress.load(Ordering::Relaxed) as u64,
+            cl_active_connections_ingress: self.inner.cl_active_connections_ingress.load(Ordering::Relaxed) as u64,
+            cl_active_connections_egress: self.inner.cl_active_connections_egress.load(Ordering::Relaxed) as u64,
+            el_unique_peers_ingress: self.inner.el_unique_peers_ingress.lock().unwrap().len() as u64,
             el_unique_peers_egress: self.inner.el_unique_peers_egress.lock().unwrap().len() as u64,
-            cl_unique_peers_ingress: self.inner.cl_unique_peers_ingress.lock().unwrap().len()
-                as u64,
+            cl_unique_peers_ingress: self.inner.cl_unique_peers_ingress.lock().unwrap().len() as u64,
             cl_unique_peers_egress: self.inner.cl_unique_peers_egress.lock().unwrap().len() as u64,
 
             el_tx_hashes_received: self.inner.el_tx_hashes_received.load(Ordering::Relaxed),
             el_txs_received: self.inner.el_txs_received.load(Ordering::Relaxed),
             cl_blocks_received: self.inner.cl_blocks_received.load(Ordering::Relaxed),
-            cl_finality_updates_received: self
-                .inner
-                .cl_finality_updates_received
-                .load(Ordering::Relaxed),
+            cl_finality_updates_received: self.inner.cl_finality_updates_received.load(Ordering::Relaxed),
             cl_status_received: self.inner.cl_status_received.load(Ordering::Relaxed),
             cl_status_sent: self.inner.cl_status_sent.load(Ordering::Relaxed),
-            cl_blocks_by_range_requests_sent: self
-                .inner
-                .cl_blocks_by_range_requests_sent
-                .load(Ordering::Relaxed),
-            cl_blocks_by_range_responses_received: self
-                .inner
-                .cl_blocks_by_range_responses_received
-                .load(Ordering::Relaxed),
+            cl_blocks_by_range_requests_sent: self.inner.cl_blocks_by_range_requests_sent.load(Ordering::Relaxed),
+            cl_blocks_by_range_responses_received: self.inner.cl_blocks_by_range_responses_received.load(Ordering::Relaxed),
 
             cl_blocks_by_range_latency_avg_ns: {
-                let sum = self
-                    .inner
-                    .cl_blocks_by_range_latency_sum
-                    .load(Ordering::Relaxed);
-                let count = self
-                    .inner
-                    .cl_blocks_by_range_latency_count
-                    .load(Ordering::Relaxed);
-                if count > 0 { sum / count } else { 0 }
+                let sum = self.inner.cl_blocks_by_range_latency_sum.load(Ordering::Relaxed);
+                let count = self.inner.cl_blocks_by_range_latency_count.load(Ordering::Relaxed);
+                if count > 0 {
+                    sum / count
+                } else {
+                    0
+                }
             },
             cl_status_latency_avg_ns: {
                 let sum = self.inner.cl_status_latency_sum.load(Ordering::Relaxed);
                 let count = self.inner.cl_status_latency_count.load(Ordering::Relaxed);
-                if count > 0 { sum / count } else { 0 }
+                if count > 0 {
+                    sum / count
+                } else {
+                    0
+                }
             },
         }
     }
@@ -414,14 +388,12 @@ impl RuntimeTelemetry {
 
     #[allow(dead_code)]
     pub(crate) fn record_consensus_finalized_slot(&self, slot: Slot) {
-        self.consensus_finalized_slot
-            .store(slot.0, Ordering::Relaxed);
+        self.consensus_finalized_slot.store(slot.0, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_consensus_finalized_number(&self, number: BlockNumber) {
-        self.consensus_finalized_number
-            .store(number.0, Ordering::Relaxed);
+        self.consensus_finalized_number.store(number.0, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -429,24 +401,20 @@ impl RuntimeTelemetry {
         if ingress {
             self.el_connections_ingress.fetch_add(1, Ordering::Relaxed);
             self.el_unique_peers_ingress.lock().unwrap().insert(peer_id);
-            self.el_active_connections_ingress
-                .fetch_add(1, Ordering::Relaxed);
+            self.el_active_connections_ingress.fetch_add(1, Ordering::Relaxed);
         } else {
             self.el_connections_egress.fetch_add(1, Ordering::Relaxed);
             self.el_unique_peers_egress.lock().unwrap().insert(peer_id);
-            self.el_active_connections_egress
-                .fetch_add(1, Ordering::Relaxed);
+            self.el_active_connections_egress.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_el_disconnection(&self, ingress: bool) {
         if ingress {
-            self.el_active_connections_ingress
-                .fetch_sub(1, Ordering::Relaxed);
+            self.el_active_connections_ingress.fetch_sub(1, Ordering::Relaxed);
         } else {
-            self.el_active_connections_egress
-                .fetch_sub(1, Ordering::Relaxed);
+            self.el_active_connections_egress.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -455,24 +423,20 @@ impl RuntimeTelemetry {
         if ingress {
             self.cl_connections_ingress.fetch_add(1, Ordering::Relaxed);
             self.cl_unique_peers_ingress.lock().unwrap().insert(peer_id);
-            self.cl_active_connections_ingress
-                .fetch_add(1, Ordering::Relaxed);
+            self.cl_active_connections_ingress.fetch_add(1, Ordering::Relaxed);
         } else {
             self.cl_connections_egress.fetch_add(1, Ordering::Relaxed);
             self.cl_unique_peers_egress.lock().unwrap().insert(peer_id);
-            self.cl_active_connections_egress
-                .fetch_add(1, Ordering::Relaxed);
+            self.cl_active_connections_egress.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_cl_disconnection(&self, ingress: bool) {
         if ingress {
-            self.cl_active_connections_ingress
-                .fetch_sub(1, Ordering::Relaxed);
+            self.cl_active_connections_ingress.fetch_sub(1, Ordering::Relaxed);
         } else {
-            self.cl_active_connections_egress
-                .fetch_sub(1, Ordering::Relaxed);
+            self.cl_active_connections_egress.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -493,16 +457,14 @@ impl RuntimeTelemetry {
 
     #[allow(dead_code)]
     pub(crate) fn record_cl_finality_update_received(&self) {
-        self.cl_finality_updates_received
-            .fetch_add(1, Ordering::Relaxed);
+        self.cl_finality_updates_received.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_cl_status_received(&self, latency_ns: u64) {
         self.cl_status_received.fetch_add(1, Ordering::Relaxed);
         if latency_ns > 0 {
-            self.cl_status_latency_sum
-                .fetch_add(latency_ns, Ordering::Relaxed);
+            self.cl_status_latency_sum.fetch_add(latency_ns, Ordering::Relaxed);
             self.cl_status_latency_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -514,18 +476,14 @@ impl RuntimeTelemetry {
 
     #[allow(dead_code)]
     pub(crate) fn record_cl_blocks_by_range_request_sent(&self) {
-        self.cl_blocks_by_range_requests_sent
-            .fetch_add(1, Ordering::Relaxed);
+        self.cl_blocks_by_range_requests_sent.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_cl_blocks_by_range_response_received(&self, latency_ns: u64) {
-        self.cl_blocks_by_range_responses_received
-            .fetch_add(1, Ordering::Relaxed);
-        self.cl_blocks_by_range_latency_sum
-            .fetch_add(latency_ns, Ordering::Relaxed);
-        self.cl_blocks_by_range_latency_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.cl_blocks_by_range_responses_received.fetch_add(1, Ordering::Relaxed);
+        self.cl_blocks_by_range_latency_sum.fetch_add(latency_ns, Ordering::Relaxed);
+        self.cl_blocks_by_range_latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Exports current snapshots to global metrics (e.g. for Prometheus).
@@ -533,57 +491,34 @@ impl RuntimeTelemetry {
         gauge!("mempool_pending_seen").set(self.pending_seen.load(Ordering::Relaxed) as f64);
         gauge!("mempool_block_count").set(self.block_count.load(Ordering::Relaxed) as f64);
         gauge!("mempool_last_block_txs").set(self.last_block_txs.load(Ordering::Relaxed) as f64);
-        gauge!("mempool_last_block_gas_used")
-            .set(self.last_block_gas_used.load(Ordering::Relaxed) as f64);
+        gauge!("mempool_last_block_gas_used").set(self.last_block_gas_used.load(Ordering::Relaxed) as f64);
 
         gauge!("p2p_peer_count_el").set(self.p2p_peer_count.load(Ordering::Relaxed) as f64);
         gauge!("p2p_peer_count_cl").set(self.consensus_peer_count.load(Ordering::Relaxed) as f64);
 
-        gauge!("p2p_connections_ingress_el")
-            .set(self.el_connections_ingress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_connections_egress_el")
-            .set(self.el_connections_egress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_connections_ingress_cl")
-            .set(self.cl_connections_ingress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_connections_egress_cl")
-            .set(self.cl_connections_egress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_connections_ingress_el").set(self.el_connections_ingress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_connections_egress_el").set(self.el_connections_egress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_connections_ingress_cl").set(self.cl_connections_ingress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_connections_egress_cl").set(self.cl_connections_egress.load(Ordering::Relaxed) as f64);
 
-        gauge!("p2p_active_connections_ingress_el")
-            .set(self.el_active_connections_ingress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_active_connections_egress_el")
-            .set(self.el_active_connections_egress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_active_connections_ingress_cl")
-            .set(self.cl_active_connections_ingress.load(Ordering::Relaxed) as f64);
-        gauge!("p2p_active_connections_egress_cl")
-            .set(self.cl_active_connections_egress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_active_connections_ingress_el").set(self.el_active_connections_ingress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_active_connections_egress_el").set(self.el_active_connections_egress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_active_connections_ingress_cl").set(self.cl_active_connections_ingress.load(Ordering::Relaxed) as f64);
+        gauge!("p2p_active_connections_egress_cl").set(self.cl_active_connections_egress.load(Ordering::Relaxed) as f64);
 
-        gauge!("p2p_unique_peers_ingress_el")
-            .set(self.el_unique_peers_ingress.lock().unwrap().len() as f64);
-        gauge!("p2p_unique_peers_egress_el")
-            .set(self.el_unique_peers_egress.lock().unwrap().len() as f64);
-        gauge!("p2p_unique_peers_ingress_cl")
-            .set(self.cl_unique_peers_ingress.lock().unwrap().len() as f64);
-        gauge!("p2p_unique_peers_egress_cl")
-            .set(self.cl_unique_peers_egress.lock().unwrap().len() as f64);
+        gauge!("p2p_unique_peers_ingress_el").set(self.el_unique_peers_ingress.lock().unwrap().len() as f64);
+        gauge!("p2p_unique_peers_egress_el").set(self.el_unique_peers_egress.lock().unwrap().len() as f64);
+        gauge!("p2p_unique_peers_ingress_cl").set(self.cl_unique_peers_ingress.lock().unwrap().len() as f64);
+        gauge!("p2p_unique_peers_egress_cl").set(self.cl_unique_peers_egress.lock().unwrap().len() as f64);
 
-        counter!("el_tx_hashes_received_total")
-            .absolute(self.el_tx_hashes_received.load(Ordering::Relaxed));
+        counter!("el_tx_hashes_received_total").absolute(self.el_tx_hashes_received.load(Ordering::Relaxed));
         counter!("el_txs_received_total").absolute(self.el_txs_received.load(Ordering::Relaxed));
-        counter!("cl_blocks_received_total")
-            .absolute(self.cl_blocks_received.load(Ordering::Relaxed));
-        counter!("cl_finality_updates_received_total")
-            .absolute(self.cl_finality_updates_received.load(Ordering::Relaxed));
-        counter!("cl_status_received_total")
-            .absolute(self.cl_status_received.load(Ordering::Relaxed));
+        counter!("cl_blocks_received_total").absolute(self.cl_blocks_received.load(Ordering::Relaxed));
+        counter!("cl_finality_updates_received_total").absolute(self.cl_finality_updates_received.load(Ordering::Relaxed));
+        counter!("cl_status_received_total").absolute(self.cl_status_received.load(Ordering::Relaxed));
         counter!("cl_status_sent_total").absolute(self.cl_status_sent.load(Ordering::Relaxed));
-        counter!("cl_blocks_by_range_requests_total").absolute(
-            self.cl_blocks_by_range_requests_sent
-                .load(Ordering::Relaxed),
-        );
-        counter!("cl_blocks_by_range_responses_total").absolute(
-            self.cl_blocks_by_range_responses_received
-                .load(Ordering::Relaxed),
-        );
+        counter!("cl_blocks_by_range_requests_total").absolute(self.cl_blocks_by_range_requests_sent.load(Ordering::Relaxed));
+        counter!("cl_blocks_by_range_responses_total").absolute(self.cl_blocks_by_range_responses_received.load(Ordering::Relaxed));
 
         let head = self.consensus_last_block_number.load(Ordering::Relaxed);
         let finalized = self.consensus_finalized_number.load(Ordering::Relaxed);
