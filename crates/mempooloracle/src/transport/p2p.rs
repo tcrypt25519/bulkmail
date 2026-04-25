@@ -15,7 +15,7 @@ mod enabled {
         chainspec::{Head, MAINNET as chainspecs},
         network::{
             NetworkConfig, NetworkEvent, NetworkEventListenerProvider, NetworkManager,
-            events::PeerEvent,
+            events::{PeerEvent, SessionInfo},
         },
         pool::{
             CoinbaseTipOrdering, EthPooledTransaction, Pool, TransactionListenerKind,
@@ -241,56 +241,77 @@ mod enabled {
                     match event {
                         NetworkEvent::ActivePeerSession { info, .. } => {
                             tracing::debug!(peer_id = %info.peer_id, "Execution peer session active");
-                            // TODO: Correctly determine direction
-                            let is_ingress = true;
+                            let is_ingress = false;
                             let dir_str = if is_ingress { "IN " } else { "OUT" };
-                            audit_log.log("EL", dir_str, &info.peer_id.to_string(), "SessionActive");
+                            let peer_id = info.peer_id.to_string();
+                            let detail = execution_session_detail(&info);
+                            audit_log.log("EL", dir_str, &peer_id, &format!("SessionActive {detail}"));
+                            telemetry.record_peer_event("EL", dir_str.trim(), peer_id.clone(), "SessionActive", detail);
 
                             if peers.insert(info.peer_id) {
                                 peer_directions.insert(info.peer_id, is_ingress);
-                                telemetry.record_el_connection(info.peer_id.to_string(), is_ingress);
+                                telemetry.record_el_connection(peer_id, Some(is_ingress));
                             }
                             telemetry.record_p2p_peer_count(peers.len());
                         }
                         NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
                             tracing::debug!(peer_id = %info.peer_id, "Execution peer connected");
-                            // TODO: Correctly determine direction
-                            let is_ingress = true;
+                            let is_ingress = false;
                             let dir_str = if is_ingress { "IN " } else { "OUT" };
-                            audit_log.log("EL", dir_str, &info.peer_id.to_string(), "Connected");
+                            let peer_id = info.peer_id.to_string();
+                            let detail = execution_session_detail(&info);
+                            audit_log.log("EL", dir_str, &peer_id, &format!("Connected {detail}"));
+                            telemetry.record_peer_event("EL", dir_str.trim(), peer_id.clone(), "Connected", detail);
 
                             if peers.insert(info.peer_id) {
                                 peer_directions.insert(info.peer_id, is_ingress);
-                                telemetry.record_el_connection(info.peer_id.to_string(), is_ingress);
+                                telemetry.record_el_connection(peer_id, Some(is_ingress));
                             }
                             telemetry.record_p2p_peer_count(peers.len());
                         }
-                        NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) => {
+                        NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                             tracing::debug!(peer_id = %peer_id, "Execution peer session closed");
-                            audit_log.log("EL", "END", &peer_id.to_string(), "SessionClosed");
+                            let detail = reason
+                                .map(|reason| format!("reason={reason:?}"))
+                                .unwrap_or_else(|| "reason=unknown".to_owned());
+                            audit_log.log("EL", "END", &peer_id.to_string(), &format!("SessionClosed {detail}"));
+                            telemetry.record_peer_event("EL", "END", peer_id.to_string(), "SessionClosed", detail);
                             peers.remove(&peer_id);
                             if let Some(is_ingress) = peer_directions.remove(&peer_id) {
-                                telemetry.record_el_disconnection(is_ingress);
+                                telemetry.record_el_disconnection(Some(is_ingress));
                             }
                             telemetry.record_p2p_peer_count(peers.len());
+                        }
+                        NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id)) => {
+                            tracing::debug!(peer_id = %peer_id, "Execution peer added");
+                            audit_log.log("EL", "INF", &peer_id.to_string(), "PeerAdded");
+                            telemetry.record_peer_event("EL", "INF", peer_id.to_string(), "PeerAdded", String::new());
                         }
                         NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
                             tracing::debug!(peer_id = %peer_id, "Execution peer removed");
                             audit_log.log("EL", "END", &peer_id.to_string(), "PeerRemoved");
+                            telemetry.record_peer_event("EL", "END", peer_id.to_string(), "PeerRemoved", String::new());
                             peers.remove(&peer_id);
                             if let Some(is_ingress) = peer_directions.remove(&peer_id) {
-                                telemetry.record_el_disconnection(is_ingress);
+                                telemetry.record_el_disconnection(Some(is_ingress));
                             }
                             telemetry.record_p2p_peer_count(peers.len());
-                        }
-                        NetworkEvent::Peer(other) => {
-                            tracing::trace!(event = ?other, "Other execution peer event");
-                            audit_log.log("EL", "INF", "unknown", &format!("{other:?}"));
                         }
                     }
                 }
             }
         }
+    }
+
+    fn execution_session_detail(info: &SessionInfo) -> String {
+        format!(
+            "addr={} client={} version={:?} kind={:?} caps={:?}",
+            info.remote_addr,
+            info.client_version,
+            info.version,
+            info.peer_kind,
+            info.capabilities.capabilities()
+        )
     }
 
     async fn run_pending_listener(
@@ -631,6 +652,13 @@ mod enabled {
                     state
                         .audit_log
                         .log("CL", "IN ", &peer_id.to_string(), "Connected");
+                    telemetry.record_peer_event(
+                        "CL",
+                        "IN",
+                        peer_id.to_string(),
+                        "Connected",
+                        String::new(),
+                    );
                     state.connected_peers.insert(peer_id);
                     state.peer_directions.insert(peer_id, true);
                     telemetry.record_cl_connection(peer_id.to_string(), true);
@@ -640,6 +668,13 @@ mod enabled {
                     state
                         .audit_log
                         .log("CL", "OUT", &peer_id.to_string(), "Connected");
+                    telemetry.record_peer_event(
+                        "CL",
+                        "OUT",
+                        peer_id.to_string(),
+                        "Connected",
+                        String::new(),
+                    );
                     state.connected_peers.insert(peer_id);
                     state.peer_directions.insert(peer_id, false);
                     telemetry.record_cl_connection(peer_id.to_string(), false);
@@ -649,6 +684,13 @@ mod enabled {
                     state
                         .audit_log
                         .log("CL", "END", &peer_id.to_string(), "Disconnected");
+                    telemetry.record_peer_event(
+                        "CL",
+                        "END",
+                        peer_id.to_string(),
+                        "Disconnected",
+                        String::new(),
+                    );
                     state.connected_peers.remove(&peer_id);
                     state.peer_statuses.remove(&peer_id);
                     if let Some(is_ingress) = state.peer_directions.remove(&peer_id) {
@@ -660,6 +702,13 @@ mod enabled {
                     state
                         .audit_log
                         .log("CL", "OUT", &peer_id.to_string(), "StatusRequest");
+                    telemetry.record_peer_event(
+                        "CL",
+                        "OUT",
+                        peer_id.to_string(),
+                        "StatusRequest",
+                        String::new(),
+                    );
                     telemetry.record_cl_status_sent();
                     state
                         .pending_status_requests
@@ -681,6 +730,13 @@ mod enabled {
                         &peer_id.to_string(),
                         &format!("StatusRequest {remote:?}"),
                     );
+                    telemetry.record_peer_event(
+                        "CL",
+                        "IN",
+                        peer_id.to_string(),
+                        "StatusRequest",
+                        format!("{remote:?}"),
+                    );
                     telemetry.record_cl_status_received(0);
                     state.peer_statuses.insert(peer_id, remote);
                     service.send_response(
@@ -699,6 +755,13 @@ mod enabled {
                         "IN ",
                         &peer_id.to_string(),
                         &format!("StatusResponse {status:?}"),
+                    );
+                    telemetry.record_peer_event(
+                        "CL",
+                        "IN",
+                        peer_id.to_string(),
+                        "StatusResponse",
+                        format!("{status:?}"),
                     );
                     let latency = state
                         .pending_status_requests
@@ -790,6 +853,13 @@ mod enabled {
                             "BlocksByRangeResponse id={request_id} count={}",
                             block.is_some() as usize
                         ),
+                    );
+                    telemetry.record_peer_event(
+                        "CL",
+                        "IN",
+                        peer_id.to_string(),
+                        "BlocksByRangeResponse",
+                        format!("id={request_id} count={}", block.is_some() as usize),
                     );
 
                     if let Some(chunk) = state.pending_recovery_chunks.get(&request_id) {
@@ -900,6 +970,13 @@ mod enabled {
                             "BlocksByRangeRequest id={request_id} from={current_slot} count={count}"
                         ),
                     );
+                    telemetry.record_peer_event(
+                        "CL",
+                        "OUT",
+                        peer_id.to_string(),
+                        "BlocksByRangeRequest",
+                        format!("id={request_id} from={current_slot} count={count}"),
+                    );
                     telemetry.record_cl_blocks_by_range_request_sent();
 
                     if service
@@ -992,9 +1069,11 @@ mod enabled {
             telemetry.record_consensus_anchor(BlockNumber(anchor.number));
             telemetry.record_consensus_last_block(BlockNumber(anchor.number));
             telemetry.record_consensus_next_expected(BlockNumber(anchor.number + 1));
+            telemetry.record_block(anchor.update.included_txs.len(), anchor.update.gas_used);
 
             state.last_emitted_number = Some(anchor.number);
             state.last_emitted_slot = Some(anchor.slot);
+            state.slot_to_number.insert(anchor.slot, anchor.number);
             state.pending_recovery_chunks.clear();
             state.recovery_target_number = None;
             state.recovery_target_block = None;

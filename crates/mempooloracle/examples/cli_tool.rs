@@ -1,10 +1,12 @@
+#![allow(dead_code)]
+
 use alloy::providers::{WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
     BlockNumber, BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation,
     ExecutionHash, MempoolEvent, MempoolHandle, MempoolTracker, P2pBlockTransport,
-    P2pTransportConfig, PendingTx, Slot, TrackerConfig, TrackerTransport,
+    P2pTransportConfig, PeerEventSnapshot, PendingTx, Slot, TrackerConfig, TrackerTransport,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -321,6 +323,14 @@ fn run_plaintext(
                 snapshot.cl_status_received,
                 snapshot.cl_status_sent,
             );
+            if snapshot.recent_peer_events.is_empty() {
+                println!("  peers: no peer events captured yet");
+            } else {
+                println!("  recent peer events:");
+                for event in snapshot.recent_peer_events.iter().rev().take(4).rev() {
+                    println!("    {}", format_peer_event(event));
+                }
+            }
 
             last_render = Instant::now();
         }
@@ -455,9 +465,18 @@ fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(area);
 
-    render_metrics(frame, columns[0], app);
+    render_left_column(frame, columns[0], app);
     render_base_fee_chart(frame, columns[1], app);
     render_top_transactions(frame, columns[2], app);
+}
+
+fn render_left_column(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(5)])
+        .split(area);
+    render_metrics(frame, rows[0], app);
+    render_peer_events(frame, rows[1], app);
 }
 
 fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
@@ -501,6 +520,61 @@ fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Live Metrics"))
         .wrap(Wrap { trim: true });
     frame.render_widget(metrics, area);
+}
+
+fn render_peer_events(frame: &mut Frame, area: Rect, app: &App) {
+    let visible_rows = area.height.saturating_sub(2).max(1) as usize;
+    let items: Vec<ListItem> = if app.latest().recent_peer_events.is_empty() {
+        vec![ListItem::new("No peer events captured yet.")]
+    } else {
+        app.latest()
+            .recent_peer_events
+            .iter()
+            .rev()
+            .take(visible_rows)
+            .map(|event| ListItem::new(format_peer_event(event)))
+            .collect()
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Recent Peer Events"),
+    );
+    frame.render_widget(list, area);
+}
+
+fn format_peer_event(event: &PeerEventSnapshot) -> String {
+    let peer = short_peer_id(&event.peer_id);
+    if event.detail.is_empty() {
+        format!(
+            "{} {:>3} {:>3} {:<22} {}",
+            event.timestamp_ms, event.layer, event.direction, event.event, peer
+        )
+    } else {
+        format!(
+            "{} {:>3} {:>3} {:<22} {} {}",
+            event.timestamp_ms,
+            event.layer,
+            event.direction,
+            event.event,
+            peer,
+            truncate(&event.detail, 72)
+        )
+    }
+}
+
+fn short_peer_id(peer_id: &str) -> &str {
+    peer_id.get(..12).unwrap_or(peer_id)
+}
+
+fn truncate(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        value.to_owned()
+    } else {
+        let prefix: String = value.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{prefix}...")
+    }
 }
 
 fn render_base_fee_chart(frame: &mut Frame, area: Rect, app: &App) {
@@ -728,6 +802,7 @@ struct Snapshot {
     cl_blocks_by_range_requests_sent: u64,
     cl_blocks_by_range_responses_received: u64,
     cl_blocks_by_range_latency_avg_ns: u64,
+    recent_peer_events: Vec<PeerEventSnapshot>,
     ranked_rows: Vec<TxRow>,
 }
 
@@ -822,6 +897,7 @@ impl Snapshot {
             cl_blocks_by_range_requests_sent: telemetry.cl_blocks_by_range_requests_sent,
             cl_blocks_by_range_responses_received: telemetry.cl_blocks_by_range_responses_received,
             cl_blocks_by_range_latency_avg_ns: telemetry.cl_blocks_by_range_latency_avg_ns,
+            recent_peer_events: telemetry.recent_peer_events,
             ranked_rows,
         }
     }
@@ -873,9 +949,10 @@ struct Telemetry {
     cl_blocks_by_range_requests_sent: u64,
     cl_blocks_by_range_responses_received: u64,
     cl_blocks_by_range_latency_avg_ns: u64,
+    recent_peer_events: Vec<PeerEventSnapshot>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct AlloyTelemetryView {
     pending_seen: u64,
     block_count: u64,
@@ -910,6 +987,7 @@ struct AlloyTelemetryView {
     cl_blocks_by_range_requests_sent: u64,
     cl_blocks_by_range_responses_received: u64,
     cl_blocks_by_range_latency_avg_ns: u64,
+    recent_peer_events: Vec<PeerEventSnapshot>,
 }
 
 impl From<Telemetry> for AlloyTelemetryView {
@@ -945,6 +1023,7 @@ impl From<Telemetry> for AlloyTelemetryView {
             cl_blocks_by_range_requests_sent: value.cl_blocks_by_range_requests_sent,
             cl_blocks_by_range_responses_received: value.cl_blocks_by_range_responses_received,
             cl_blocks_by_range_latency_avg_ns: value.cl_blocks_by_range_latency_avg_ns,
+            recent_peer_events: Vec::new(),
         }
     }
 }
@@ -982,6 +1061,7 @@ impl From<AlloyTrackerTelemetrySnapshot> for AlloyTelemetryView {
             cl_blocks_by_range_requests_sent: value.cl_blocks_by_range_requests_sent,
             cl_blocks_by_range_responses_received: value.cl_blocks_by_range_responses_received,
             cl_blocks_by_range_latency_avg_ns: value.cl_blocks_by_range_latency_avg_ns,
+            recent_peer_events: value.recent_peer_events.into_iter().collect(),
         }
     }
 }

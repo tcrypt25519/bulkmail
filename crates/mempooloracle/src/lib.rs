@@ -9,7 +9,8 @@ use std::sync::{Arc, RwLock, mpsc::Receiver};
 use std::time::SystemTime;
 
 pub use runtime::{
-    TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind, init_metrics,
+    PeerEventSnapshot, TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind,
+    init_metrics,
 };
 use transport::{p2p, rpc};
 

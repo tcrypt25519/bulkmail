@@ -1,14 +1,16 @@
 use crate::{BlockNumber, MempoolHandle, Slot};
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{sync::watch, task::JoinHandle};
 
 pub(crate) const DEFAULT_SHUTDOWN_VALUE: bool = false;
+const RECENT_PEER_EVENTS_LIMIT: usize = 64;
 
 /// Initializes the global Prometheus metrics exporter.
 pub fn init_metrics(port: u16) -> Result<(), String> {
@@ -188,6 +190,7 @@ impl TrackerTelemetry {
                 let count = self.inner.cl_status_latency_count.load(Ordering::Relaxed);
                 if count > 0 { sum / count } else { 0 }
             },
+            recent_peer_events: self.inner.recent_peer_events.lock().unwrap().clone(),
         }
     }
 }
@@ -199,7 +202,7 @@ pub enum TransportKind {
     P2p,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TrackerTelemetrySnapshot {
     pub transport_kind: TransportKind,
     pub pending_seen: u64,
@@ -247,6 +250,18 @@ pub struct TrackerTelemetrySnapshot {
     // Latency (nanos)
     pub cl_blocks_by_range_latency_avg_ns: u64,
     pub cl_status_latency_avg_ns: u64,
+
+    pub recent_peer_events: VecDeque<PeerEventSnapshot>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PeerEventSnapshot {
+    pub timestamp_ms: u128,
+    pub layer: String,
+    pub direction: String,
+    pub peer_id: String,
+    pub event: String,
+    pub detail: String,
 }
 
 pub(crate) struct RuntimeTelemetry {
@@ -298,6 +313,8 @@ pub(crate) struct RuntimeTelemetry {
     cl_blocks_by_range_latency_count: AtomicU64,
     cl_status_latency_sum: AtomicU64,
     cl_status_latency_count: AtomicU64,
+
+    recent_peer_events: Mutex<VecDeque<PeerEventSnapshot>>,
 }
 
 impl RuntimeTelemetry {
@@ -348,6 +365,7 @@ impl RuntimeTelemetry {
             cl_blocks_by_range_latency_count: AtomicU64::default(),
             cl_status_latency_sum: AtomicU64::default(),
             cl_status_latency_count: AtomicU64::default(),
+            recent_peer_events: Mutex::new(VecDeque::with_capacity(RECENT_PEER_EVENTS_LIMIT)),
         }
     }
 
@@ -433,8 +451,8 @@ impl RuntimeTelemetry {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_el_connection(&self, peer_id: String, ingress: bool) {
-        if ingress {
+    pub(crate) fn record_el_connection(&self, peer_id: String, ingress: Option<bool>) {
+        if ingress == Some(true) {
             self.el_connections_ingress.fetch_add(1, Ordering::Relaxed);
             self.el_unique_peers_ingress.lock().unwrap().insert(peer_id);
             self.el_active_connections_ingress
@@ -448,8 +466,8 @@ impl RuntimeTelemetry {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_el_disconnection(&self, ingress: bool) {
-        if ingress {
+    pub(crate) fn record_el_disconnection(&self, ingress: Option<bool>) {
+        if ingress == Some(true) {
             self.el_active_connections_ingress
                 .fetch_sub(1, Ordering::Relaxed);
         } else {
@@ -534,6 +552,33 @@ impl RuntimeTelemetry {
             .fetch_add(latency_ns, Ordering::Relaxed);
         self.cl_blocks_by_range_latency_count
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_peer_event(
+        &self,
+        layer: &str,
+        direction: &str,
+        peer_id: String,
+        event: &str,
+        detail: String,
+    ) {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let mut events = self.recent_peer_events.lock().unwrap();
+        if events.len() == RECENT_PEER_EVENTS_LIMIT {
+            events.pop_front();
+        }
+        events.push_back(PeerEventSnapshot {
+            timestamp_ms,
+            layer: layer.to_owned(),
+            direction: direction.to_owned(),
+            peer_id,
+            event: event.to_owned(),
+            detail,
+        });
     }
 
     /// Exports current snapshots to global metrics (e.g. for Prometheus).
