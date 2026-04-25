@@ -29,8 +29,12 @@ parking_lot = "0.12.1"
 rand = "0.10.0"
 ratatui = "0.29.0"
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.3", default-features = false }
+reth-discv4 = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.3", default-features = false }
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.3", default-features = false }
-rustls = { version = "0.23.36", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23.36", default-features = false, features = [
+    "std",
+    "ring",
+] }
 secp256k1 = "0.31.1"
 serde = { version = "1.0.228", features = ["derive"] }
 simple_logger = "5.2.0"
@@ -38,7 +42,13 @@ solana-client = { version = "2.2", default-features = false }
 solana-sdk = { version = "2.2", default-features = false, features = ["full"] }
 solana-transaction-status = { version = "2.2", default-features = false }
 thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.49.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
 tracing = "0.1"
 
 [profile.release]
@@ -47,8 +57,9 @@ lto = true
 codegen-units = 1
 
 [profile.ci]
-inherits = "dev"
 debug = false
+
+inherits = "dev"
 incremental = false
 debug-assertions = true
 overflow-checks = true

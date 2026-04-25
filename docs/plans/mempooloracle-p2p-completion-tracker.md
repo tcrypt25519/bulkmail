@@ -13,7 +13,11 @@ From the caller's point of view, P2P is one thing. The execution and consensus n
 
 ## Current Status
 
-The transport and build baseline are in place and the direct P2P runtime is fully operational and verified with live mainnet data.
+The transport and build baseline are in place, and the runtime can boot both
+network stacks with the feature set enabled. Consensus Layer live runs have
+connected to peers and received block/finality traffic. The Execution Layer path
+now performs discovery and seed-cache priming, but sustained EL sessions and
+pending transaction gossip are still unresolved.
 
 What works now:
 - transport-neutral tracker runtime/API exists
@@ -23,8 +27,9 @@ What works now:
 - the P2P transport boots both network stacks together
 - consensus beacon block gossip is converted into `MempoolEvent::NewBlock`
 - consensus finality update gossip is converted into `MempoolEvent::FinalizedBlock`
-- Execution Layer status is dynamically updated from Consensus Layer gossip to maintain peer connectivity
-- Comprehensive P2P instrumentation and persistent audit logging are implemented
+- persistent P2P audit logging is implemented
+- build issues have been resolved with feature gating for `reth-p2p`
+- EL discovery and local seed-cache priming are implemented
 
 ## Completed Work
 
@@ -34,55 +39,56 @@ What works now:
 4.  Removed the fake "disabled block transport" path from the public P2P configuration.
 5.  Added tracker reset support (`MempoolEvent::Reset`).
 6.  Replaced the old stubbed `transport/p2p.rs` path with a combined runtime.
-7.  **Block Finalization:** Added support for `LightClientFinalityUpdate` and `FinalizedBlock` events.
-8.  **Dynamic Synchronization:** Implemented dynamic EL status updates (block number/hash) driven by CL block gossip to prevent peer disconnections.
-9.  **Accurate Network Context:** Configured the system with current mainnet bootnodes, chainspec, and a reliable initial slot.
-10. **Enhanced Instrumentation:** Added tracking for peer counts, message counts, latencies, and unfinalized depth.
-11. **Audit Logging:** Implemented an optional persistent P2P event log for recording all connections and message flow.
+7.  Added support for `LightClientFinalityUpdate` and `FinalizedBlock` events.
+8.  Configured the system with current mainnet bootnodes, chainspec, and runtime fork context.
+9.  Added tracking for peer counts, message counts, latencies, and unfinalized depth.
+10. Implemented an optional persistent P2P event log for recording connections and message flow.
+11. Added EL discovery logging and local execution peer seed-cache priming.
 
 ## Remaining Work
 
-1.  **Attach/Detach Semantics & Reorg Handling:**
-    *   **Strict Continuity:** Implement `attach_block(N+1)` which requires block `N` as its predecessor. Returns an error if a gap is detected (N+2 or later).
-    *   **Block History:** Maintain a circular buffer (ring buffer) of the last 32 attached blocks (number + hash).
-    *   **Detach Logic:** Implement `detach_block(block)` which reverses block effects and identifies transactions to be restored to the pool.
-    *   **Reorg Recovery:**
-        - Detect fork when `parent_hash` of new block `N` != `hash` of our block `N-1`.
-        - Walk back through the ring buffer to find the **Common Ancestor**.
-        - Call `detach_block` on all blocks from current head back to the common ancestor.
-        - Collect detached transactions into a "restore set".
-        - Iterate forward on the new chain, calling `attach_block` for each block.
-        - During attachment, re-remove any transactions that appear in the new blocks.
-        - Update the real mempool with the final net-change set (additions from detached blocks, removals based on new account nonces).
+1.  **Reorg Detection & Fork Handling:**
+    *   Completed: Attach/detach semantics exist with `attach_block()` and `detach_block()`.
+    *   Completed: A 32-block circular history is maintained in `MempoolInner.history`.
+    *   Partial: Parent-hash validation exists, but fork walk-back needs live-path hardening and tests.
 
-2.  **Intelligent Multi-Peer Recovery:**
-    *   **Chunking:** Implement pagination for `BlocksByRange` requests (protocol limit is typically 128).
-    *   **Parallelism:** Send requests for different chunks to multiple peers simultaneously.
-    *   **Retry Logic:** If a peer fails, retry with a different peer for that specific chunk.
-    *   **Patience:** Only escalate to a full Prune/Re-anchor after multiple peer failures and a timeout.
+2.  **Gap Recovery System:**
+    *   Completed: Multi-peer chunked recovery exists with 128-block chunks.
+    *   Completed: Block buffering and ordered emission are implemented.
+    *   Partial: Escalation to full reset when recovery fails needs refinement.
 
 3.  **Intelligent Pruning (Escalation Path):**
-    *   **Nonce Tracking:** On a re-anchor, look ahead at all available/buffered blocks and build a map of latest nonces per account.
-    *   **Selective Retention:** Keep transactions with nonces > latest seen in blocks; discard those with earlier nonces.
-    *   **Aging & Base Fee Guards:** Keep old transactions (e.g. > 1hr) even if blocks were missed. Keep transactions paying < minimum base fee.
-    *   **Full Mempool Sync:** On re-anchor, request a full mempool snapshot from multiple peers and merge/prune instead of clearing.
+    *   Not started: Nonce-based selective retention on re-anchor.
+    *   Not started: Aging guards for old transactions.
+    *   Not started: Base fee guards for low-fee transactions.
+    *   Not started: Full mempool sync instead of wholesale clearing.
 
 4.  **Transaction Metadata:**
-    *   Add `seen_at: SystemTime` to `PendingTx` to support aging logic.
+    *   Completed: `seen_at: SystemTime` exists on `PendingTx`.
 
 5.  **Network Configuration Cleanup:**
-    *   Make consensus network directory and P2P ports (30303, 9000) configurable.
+    *   Partial: Basic port configuration exists.
+    *   Not started: Consensus network directory should be configurable.
 
 6.  **Automated Semantic Testing:**
-    *   Tests for the precise reorg walk-back, contiguous recovery, and selective pruning.
+    *   Not started: Tests for reorg walk-back, contiguous recovery, and selective pruning.
+
+7.  **Build System:**
+    *   Completed: Feature gating and compilation fixes are implemented.
 
 ## Execution Order
 
-1.  **Core Semantics:** Implement `attach_block`/`detach_block` and the 32-block ring buffer.
-2.  **Reorg Logic:** Implement the walk-back and restore-set recovery process.
-3.  **Metadata & Aging:** Add transaction timestamps.
-4.  **Parallel Recovery:** Implement chunked, multi-peer block fetching in `p2p.rs`.
-5.  **Testing:** Add automated unit/integration tests for these semantic rules.
+Completed:
+1.  Core semantics: `attach_block`/`detach_block` and the 32-block ring buffer.
+2.  Metadata: transaction timestamps through `seen_at`.
+3.  Parallel recovery: chunked, multi-peer block fetching in `p2p.rs`.
+
+Remaining:
+4.  Reorg logic: harden and test walk-back recovery for fork handling.
+5.  Intelligent pruning: add nonce-based selective retention and aging guards.
+6.  Configuration: make network directories and ports configurable.
+7.  Testing: add automated unit/integration tests for semantic rules.
+8.  EL observability: expose connection attempts, disconnect reasons, and recent peer-event history.
 
 ## Continuity Rules
 
@@ -104,3 +110,12 @@ What works now:
 - **Pruning Complexity:** Intelligent pruning is significantly more complex than a wholesale reset and requires careful nonce/aging logic.
 - **Ring Buffer Depth:** Reorgs deeper than 32 blocks will still require a full re-anchor/prune.
 - **Sync Drift:** EL/CL drift may cause temporary status mismatches during high network volatility.
+
+## Summary & Next Steps
+
+Overall completion: roughly 70%.
+
+The build and combined P2P runtime are in place, and the Consensus Layer path
+has live evidence. The highest-priority runtime gap is Execution Layer peer
+stability and transaction gossip. Reorg handling, intelligent pruning, and
+configuration cleanup remain production-readiness items.

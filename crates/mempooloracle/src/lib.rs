@@ -3,14 +3,13 @@ mod runtime;
 mod transport;
 
 use alloy::providers::fillers::TxFiller;
-use alloy::primitives::B256;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, RwLock, mpsc::Receiver};
 use std::time::SystemTime;
 
 pub use runtime::{
-    init_metrics, TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind,
+    TrackerRuntime, TrackerTelemetry, TrackerTelemetrySnapshot, TransportKind, init_metrics,
 };
 use transport::{p2p, rpc};
 
@@ -74,7 +73,19 @@ pub enum TrackerError {
 pub type AlloyTrackerError = TrackerError;
 
 /// A Consensus Layer slot number.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Slot(pub u64);
 
 impl std::fmt::Display for Slot {
@@ -84,7 +95,19 @@ impl std::fmt::Display for Slot {
 }
 
 /// An Execution Layer block number.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BlockNumber(pub u64);
 
 impl std::fmt::Display for BlockNumber {
@@ -108,11 +131,35 @@ impl std::ops::Sub<u64> for BlockNumber {
 }
 
 /// A Consensus Layer block or state root.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BeaconHash(pub [u8; 32]);
 
 /// An Execution Layer block or transaction hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ExecutionHash(pub [u8; 32]);
 
 impl From<[u8; 32]> for ExecutionHash {
@@ -410,12 +457,12 @@ impl MempoolInner {
         self.last_block_number = Some(anchor.number);
         self.last_block_hash = Some(anchor.hash);
         self.history.clear();
-        
+
         // Add anchor to history
         let prev_base_fee = self.current_base_fee; // simplified
         let prev_private_flow_ratio = self.private_flow_ratio;
         let prev_last_block_gas_limit = self.last_block_gas_limit;
-        
+
         self.history.push_back(HistoryEntry {
             block: anchor,
             removed_txs: Vec::new(),
@@ -603,8 +650,10 @@ impl MempoolInner {
         for tx in &block.included_txs {
             if let Some(account_queue) = self.account_queues.get_mut(&tx.sender) {
                 let old_confirmed_nonce = account_queue.confirmed_nonce;
-                prev_confirmed_nonces.entry(tx.sender).or_insert(old_confirmed_nonce);
-                
+                prev_confirmed_nonces
+                    .entry(tx.sender)
+                    .or_insert(old_confirmed_nonce);
+
                 account_queue.confirmed_nonce = account_queue.confirmed_nonce.max(tx.nonce + 1);
 
                 let drain_count = (account_queue.confirmed_nonce - old_confirmed_nonce) as usize;
@@ -624,7 +673,7 @@ impl MempoolInner {
         // 5. Update history and head
         self.last_block_number = Some(block.number);
         self.last_block_hash = Some(block.hash);
-        
+
         if self.history.len() == 32 {
             self.history.pop_front();
         }
@@ -643,12 +692,12 @@ impl MempoolInner {
 
     fn detach_block(&mut self) -> Option<Vec<PendingTx>> {
         let entry = self.history.pop_back()?;
-        
+
         // 1. Restore previous state
         self.current_base_fee = entry.prev_base_fee;
         self.private_flow_ratio = entry.prev_private_flow_ratio;
         self.last_block_gas_limit = entry.prev_last_block_gas_limit;
-        
+
         if let Some(new_last) = self.history.back() {
             self.last_block_number = Some(new_last.block.number);
             self.last_block_hash = Some(new_last.block.hash);
@@ -677,16 +726,17 @@ impl MempoolInner {
                 let offset = (tx.nonce - account_queue.confirmed_nonce) as usize;
                 if offset < account_queue.slots.len() {
                     account_queue.slots[offset] = Some(tx.clone());
-                    
+
                     // Re-insert into eligibility index
-                    self.base_fee_eligibility.insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
+                    self.base_fee_eligibility
+                        .insert((tx.max_fee_per_gas, tx.sender, tx.nonce), ());
                 }
             }
         }
-        
+
         // 4. Rebuild priority queue
         self.rebuild_priority_queue();
-        
+
         Some(entry.removed_txs)
     }
 

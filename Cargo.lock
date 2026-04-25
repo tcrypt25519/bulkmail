@@ -6666,6 +6666,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus 0.16.2",
  "ratatui",
+ "reth-discv4",
  "reth-ethereum",
  "reth-network-peers",
  "rustls 0.23.36",

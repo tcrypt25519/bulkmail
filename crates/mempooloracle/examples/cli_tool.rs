@@ -2,9 +2,9 @@ use alloy::providers::{WebSocketConfig, WsConnect};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use mempooloracle::{
     Address, AlloyTrackerRuntime, AlloyTrackerTelemetry, AlloyTrackerTelemetrySnapshot,
-    BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation, MempoolEvent,
-    MempoolHandle, MempoolTracker, P2pBlockTransport, P2pTransportConfig, PendingTx,
-    TrackerConfig, TrackerTransport, TxId, TrackerPrune, Slot, BlockNumber, ExecutionHash,
+    BlockNumber, BlockUpdate, ConsensusTransportConfig, ConsensusTransportImplementation,
+    ExecutionHash, MempoolEvent, MempoolHandle, MempoolTracker, P2pBlockTransport,
+    P2pTransportConfig, PendingTx, Slot, TrackerConfig, TrackerTransport,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -13,7 +13,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
 };
-use alloy::primitives::B256;
 use std::{
     env, io,
     path::PathBuf,
@@ -118,7 +117,13 @@ async fn main() -> io::Result<()> {
 
     let handle = runtime.handle();
 
-    let result = run_plaintext(handle, args.duration_secs, stop.clone(), telemetry);
+    let result = run_plaintext(
+        handle,
+        args.duration_secs,
+        stop.clone(),
+        telemetry,
+        args.ttfpt,
+    );
 
     stop.store(true, Ordering::Relaxed);
     runtime.shutdown();
@@ -271,11 +276,17 @@ fn run_plaintext(
 
             if ttfpt && snapshot.pending_seen > 0 {
                 println!("\nSUCCESS: First pending transaction observed!");
-                println!("Time to first pending transaction: {:?}", started_at.elapsed());
+                println!(
+                    "Time to first pending transaction: {:?}",
+                    started_at.elapsed()
+                );
                 process::exit(0);
             }
 
-            let unfinalized_depth = snapshot.last_block_number.0.saturating_sub(snapshot.consensus_finalized_number.0);
+            let unfinalized_depth = snapshot
+                .last_block_number
+                .0
+                .saturating_sub(snapshot.consensus_finalized_number.0);
             println!(
                 "base_fee={} expected_txs={} depth={} blocks={} pending_seen={} finalized_block={} peers(el={}, cl={})",
                 snapshot.base_fee,
@@ -417,7 +428,10 @@ fn render_gauges(frame: &mut Frame, area: Rect, app: &App) {
         .label(format!("{} tracked", snapshot.marketable_count));
     frame.render_widget(marketable, chunks[2]);
 
-    let unfinalized_depth = snapshot.last_block_number.0.saturating_sub(snapshot.consensus_finalized_number.0);
+    let unfinalized_depth = snapshot
+        .last_block_number
+        .0
+        .saturating_sub(snapshot.consensus_finalized_number.0);
     let depth_percent = (unfinalized_depth.min(128) as f64 / 128.0 * 100.0) as u16;
     let depth_gauge = Gauge::default()
         .block(
@@ -1223,7 +1237,9 @@ fn simulate_blockchain(
         let block = BlockUpdate {
             number: BlockNumber(block_number),
             hash: mempooloracle::ExecutionHash::from([block_number as u8; 32]),
-            parent_hash: mempooloracle::ExecutionHash::from([block_number.saturating_sub(1) as u8; 32]),
+            parent_hash: mempooloracle::ExecutionHash::from(
+                [block_number.saturating_sub(1) as u8; 32],
+            ),
             included_txs,
             new_base_fee: 10 + (block_number % 5) as u128,
             gas_used: 21000 * block_tx_count,

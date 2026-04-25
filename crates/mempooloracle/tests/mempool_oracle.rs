@@ -1,7 +1,6 @@
 use mempooloracle::{
-    Address, MempoolEvent, MempoolTracker, PendingTx, TrackerConfig, TrackerTransport,
-    TxClassification, ExecutionHash, P2pTransportConfig, P2pBlockTransport,
- ConsensusTransportConfig, ConsensusTransportImplementation,
+    Address, ExecutionHash, MempoolEvent, MempoolTracker, PendingTx, TrackerConfig,
+    TxClassification,
 };
 use std::sync::mpsc;
 use std::time::SystemTime;
@@ -30,7 +29,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(all(feature = "reth-p2p", feature = "consensus-p2p"))]
     async fn test_p2p_transport_requires_feature() {
+        use mempooloracle::{P2pBlockTransport, P2pTransportConfig, TrackerTransport};
+
         let result = MempoolTracker::connect(
             TrackerTransport::P2p(P2pTransportConfig {
                 chain: "mainnet".to_owned(),
@@ -39,9 +41,7 @@ mod tests {
                 listen_addr: None,
                 execution_port: None,
                 consensus_port: None,
-                block_transport: P2pBlockTransport::Consensus(ConsensusTransportConfig {
-                    implementation: ConsensusTransportImplementation::Eth2Libp2p,
-                }),
+                block_transport: P2pBlockTransport::ExecutionPolling,
                 log_path: None,
             }),
             default_config(),
@@ -49,8 +49,13 @@ mod tests {
         .await;
 
         assert!(
-            result.is_ok(),
-            "p2p transport should connect when feature is enabled"
+            matches!(
+                result,
+                Err(mempooloracle::TrackerError::UnsupportedTransport(
+                    "execution-only block polling is no longer supported"
+                ))
+            ),
+            "p2p transport should reach runtime validation when the feature is enabled"
         );
     }
 
