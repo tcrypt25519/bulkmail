@@ -71,6 +71,8 @@ mod enabled {
         InMemoryBlobStore,
     >;
 
+    const MAINNET_TERMINAL_TOTAL_DIFFICULTY: u128 = 58_750_000_000_000_000_000_000;
+
     pub async fn connect_with_config(
         config: P2pTransportConfig,
         tracker_config: TrackerConfig,
@@ -106,7 +108,8 @@ mod enabled {
             );
 
             let local_key = reth_ethereum::network::config::rng_secret_key();
-            let mut builder = NetworkConfig::builder(local_key);
+            let initial_head = current_execution_status_head();
+            let mut builder = NetworkConfig::builder(local_key).set_head(initial_head);
 
             if let Some(addr) = config.listen_addr {
                 builder = builder.set_addrs(addr);
@@ -136,18 +139,7 @@ mod enabled {
                 .transactions(pool.clone(), transactions_manager_config)
                 .split_with_handle();
 
-            // Initial status update
-            let head_hash = B256::from_str(
-                "0x41110c60043ad922dc366d7a54a31e8b802233d095e59e139621200b1aea67f8",
-            )
-            .unwrap();
-            network_handle.update_status(Head {
-                number: 24898298,
-                hash: head_hash,
-                difficulty: U256::ZERO,
-                total_difficulty: U256::ZERO,
-                timestamp: 1776414463,
-            });
+            network_handle.update_status(initial_head);
 
             let (event_tx, event_rx) = mpsc::channel();
             let telemetry = Arc::new(RuntimeTelemetry::new(TransportKind::P2p));
@@ -215,6 +207,19 @@ mod enabled {
                 })
             })
             .collect()
+    }
+
+    fn current_execution_status_head() -> Head {
+        Head {
+            number: 24898298,
+            hash: B256::from_str(
+                "0x41110c60043ad922dc366d7a54a31e8b802233d095e59e139621200b1aea67f8",
+            )
+            .unwrap(),
+            difficulty: U256::ZERO,
+            total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
+            timestamp: 1776414463,
+        }
     }
 
     async fn run_execution_peer_event_listener(
@@ -467,6 +472,7 @@ mod enabled {
         struct ObservedBlock {
             number: u64,
             hash: B256,
+            timestamp: u64,
             slot: u64,
             update: BlockUpdate,
         }
@@ -1029,8 +1035,8 @@ mod enabled {
                 number: block_number,
                 hash: block.hash,
                 difficulty: U256::ZERO,
-                total_difficulty: U256::ZERO,
-                timestamp: 0,
+                total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
+                timestamp: block.timestamp,
             });
 
             if event_tx.send(MempoolEvent::NewBlock(block.update)).is_err() {
@@ -1065,6 +1071,14 @@ mod enabled {
             {
                 return false;
             }
+
+            state.network_handle.update_status(Head {
+                number: anchor.number,
+                hash: anchor.hash,
+                difficulty: U256::ZERO,
+                total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
+                timestamp: anchor.timestamp,
+            });
 
             telemetry.record_consensus_anchor(BlockNumber(anchor.number));
             telemetry.record_consensus_last_block(BlockNumber(anchor.number));
@@ -1111,52 +1125,64 @@ mod enabled {
         ) -> Option<ObservedBlock> {
             let slot = block.message().slot();
             let payload = block.as_ref().clone().execution_payload()?;
-            let (number, hash, parent_hash, gas_used, gas_limit, new_base_fee, included_txs) =
-                match payload {
-                    CombinedExecutionPayload::Bellatrix(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                    CombinedExecutionPayload::Capella(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                    CombinedExecutionPayload::Deneb(payload) => (
-                        payload.block_number,
-                        B256::from_slice(payload.block_hash.as_bytes()),
-                        B256::from_slice(payload.parent_hash.as_bytes()),
-                        payload.gas_used,
-                        payload.gas_limit,
-                        payload
-                            .base_fee_per_gas
-                            .into_raw()
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                        decode_payload_transactions(payload.transactions.iter()),
-                    ),
-                };
+            let (
+                number,
+                hash,
+                parent_hash,
+                timestamp,
+                gas_used,
+                gas_limit,
+                new_base_fee,
+                included_txs,
+            ) = match payload {
+                CombinedExecutionPayload::Bellatrix(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.timestamp,
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload
+                        .base_fee_per_gas
+                        .into_raw()
+                        .try_into()
+                        .unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+                CombinedExecutionPayload::Capella(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.timestamp,
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload
+                        .base_fee_per_gas
+                        .into_raw()
+                        .try_into()
+                        .unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+                CombinedExecutionPayload::Deneb(payload) => (
+                    payload.block_number,
+                    B256::from_slice(payload.block_hash.as_bytes()),
+                    B256::from_slice(payload.parent_hash.as_bytes()),
+                    payload.timestamp,
+                    payload.gas_used,
+                    payload.gas_limit,
+                    payload
+                        .base_fee_per_gas
+                        .into_raw()
+                        .try_into()
+                        .unwrap_or(u128::MAX),
+                    decode_payload_transactions(payload.transactions.iter()),
+                ),
+            };
 
             Some(ObservedBlock {
                 number,
                 hash,
+                timestamp,
                 slot,
                 update: BlockUpdate {
                     number: BlockNumber(number),
