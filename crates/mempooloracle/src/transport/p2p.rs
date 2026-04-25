@@ -110,6 +110,14 @@ mod enabled {
             let local_key = reth_ethereum::network::config::rng_secret_key();
             let initial_head = current_execution_status_head();
             let mut builder = NetworkConfig::builder(local_key).set_head(initial_head);
+            let initial_status_detail = execution_status_detail(&initial_head);
+            tracing::info!(status = %initial_status_detail, "Execution P2P local status initialized");
+            P2pAuditLogger::new(config.log_path.clone()).log(
+                "EL",
+                "INF",
+                "local",
+                &format!("LocalStatus {initial_status_detail}"),
+            );
 
             if let Some(addr) = config.listen_addr {
                 builder = builder.set_addrs(addr);
@@ -220,6 +228,20 @@ mod enabled {
             total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
             timestamp: 1776414463,
         }
+    }
+
+    fn execution_status_detail(head: &Head) -> String {
+        let fork_id = chainspecs.fork_id(head);
+        format!(
+            "eth_protocols=[69,68,67,66] td={} td_hex={:#x} fork_hash={:?} fork_next={} number={} hash={:#x} timestamp={}",
+            head.total_difficulty,
+            head.total_difficulty,
+            fork_id.hash,
+            fork_id.next,
+            head.number,
+            head.hash,
+            head.timestamp,
+        )
     }
 
     async fn run_execution_peer_event_listener(
@@ -1031,13 +1053,28 @@ mod enabled {
             let gas_used = block.update.gas_used;
             let block_number = block.number;
 
-            state.network_handle.update_status(Head {
+            let head = Head {
                 number: block_number,
                 hash: block.hash,
                 difficulty: U256::ZERO,
                 total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
                 timestamp: block.timestamp,
-            });
+            };
+            state.network_handle.update_status(head);
+            let status_detail = execution_status_detail(&head);
+            state.audit_log.log(
+                "EL",
+                "INF",
+                "local",
+                &format!("StatusUpdate {status_detail}"),
+            );
+            telemetry.record_peer_event(
+                "EL",
+                "INF",
+                "local".to_owned(),
+                "StatusUpdate",
+                status_detail,
+            );
 
             if event_tx.send(MempoolEvent::NewBlock(block.update)).is_err() {
                 return false;
@@ -1072,13 +1109,28 @@ mod enabled {
                 return false;
             }
 
-            state.network_handle.update_status(Head {
+            let head = Head {
                 number: anchor.number,
                 hash: anchor.hash,
                 difficulty: U256::ZERO,
                 total_difficulty: U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY),
                 timestamp: anchor.timestamp,
-            });
+            };
+            state.network_handle.update_status(head);
+            let status_detail = execution_status_detail(&head);
+            state.audit_log.log(
+                "EL",
+                "INF",
+                "local",
+                &format!("StatusUpdate {status_detail}"),
+            );
+            telemetry.record_peer_event(
+                "EL",
+                "INF",
+                "local".to_owned(),
+                "StatusUpdate",
+                status_detail,
+            );
 
             telemetry.record_consensus_anchor(BlockNumber(anchor.number));
             telemetry.record_consensus_last_block(BlockNumber(anchor.number));
@@ -1228,6 +1280,26 @@ mod enabled {
                 .unwrap()
                 .as_millis();
             std::env::temp_dir().join(format!("mempooloracle-consensus-{unique}"))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn execution_status_reports_eth69_terminal_difficulty_and_current_fork() {
+            let head = current_execution_status_head();
+            assert_eq!(
+                head.total_difficulty,
+                U256::from(MAINNET_TERMINAL_TOTAL_DIFFICULTY)
+            );
+
+            let status_detail = execution_status_detail(&head);
+            assert!(status_detail.contains("eth_protocols=[69,68,67,66]"));
+            assert!(status_detail.contains("td=58750000000000000000000"));
+            assert!(status_detail.contains("td_hex=0xc70d808a128d7380000"));
+            assert!(status_detail.contains("fork_next=0"));
         }
     }
 }
